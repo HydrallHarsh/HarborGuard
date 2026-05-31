@@ -487,6 +487,93 @@ h1, h2, h3, h4 {
   border: 1px solid var(--border-h);
 }
 
+.credPanelBadgeRec {
+  color: #fde68a;
+  background: rgba(251, 191, 36, 0.12);
+  border-color: rgba(251, 191, 36, 0.28);
+}
+
+.llmPanel {
+  margin-top: 14px;
+}
+
+.llmToggle {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 14px;
+  font-size: 0.88rem;
+  color: var(--text);
+  cursor: pointer;
+}
+
+.llmToggle input {
+  width: 16px;
+  height: 16px;
+  accent-color: var(--accent);
+}
+
+.llmGrid {
+  grid-template-columns: 1fr 1fr;
+}
+
+.recommendedModels {
+  margin-top: 14px;
+}
+
+.recommendedLabel {
+  display: block;
+  font-size: 0.72rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text-2);
+  margin-bottom: 8px;
+}
+
+.recommendedChips {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.recommendedChip {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+  text-align: left;
+  padding: 10px 12px;
+  border-radius: var(--radius-sm);
+  border: 1px solid rgba(251, 191, 36, 0.22);
+  background: rgba(251, 191, 36, 0.06);
+  transition: border-color 0.2s var(--ease), background 0.2s var(--ease);
+}
+
+.recommendedChip:hover {
+  border-color: rgba(251, 191, 36, 0.4);
+  background: rgba(251, 191, 36, 0.1);
+}
+
+.recommendedChip strong {
+  font-family: var(--font-mono);
+  font-size: 0.76rem;
+  color: var(--text);
+  font-weight: 500;
+}
+
+.recommendedChip em {
+  font-style: normal;
+  font-size: 0.72rem;
+  color: var(--text-2);
+}
+
+.credFootnote a {
+  color: var(--accent-h);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
 .credAlert {
   display: flex;
   align-items: flex-start;
@@ -2589,7 +2676,8 @@ h1, h2, h3, h4 {
   .bTitle { font-size: 3rem; }
   .caseGrid { grid-template-columns: 1fr; }
   .cfgGrid,
-  .credGrid { grid-template-columns: 1fr; }
+  .credGrid,
+  .llmGrid { grid-template-columns: 1fr; }
   .credPanelHead { flex-direction: column; align-items: flex-start; }
   .qFormActions { align-items: stretch; }
   .qBtn { width: 100%; }

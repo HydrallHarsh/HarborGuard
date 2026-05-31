@@ -10,7 +10,8 @@ import { apiUrl, getApiBase } from "../utils/api";
 import {
   credentialsPayload,
   ensureGitHubReady,
-  fetchCapabilities,
+  fetchCapabilitiesJson,
+  isLlmPlannerReady,
   loadSourceCredentials,
   type SourceCredentials,
 } from "../utils/credentials";
@@ -33,6 +34,7 @@ type CapabilitiesResponse = {
     sources?: Record<string, SourceCapabilities>;
     tools?: Record<string, ToolCapability>;
   };
+  llm_planner?: { enabled?: boolean; configured?: boolean; model?: string | null };
 };
 type LiveQuery = { id: number; name: string; sql: string; rows: number; duration_ms: number; preview: any[] };
 type Step = { name: string; ok?: boolean; skipped?: boolean; rows?: unknown[]; error?: string | null; reason?: string; sql?: string };
@@ -160,9 +162,8 @@ function DashboardContent() {
 
   async function refreshCapabilities(creds?: SourceCredentials) {
     try {
-      const r = await fetchCapabilities(getApiBase(), creds ?? loadSourceCredentials());
-      if (!r.ok) throw new Error(`${r.status}`);
-      setCapabilities(await r.json());
+      const data = await fetchCapabilitiesJson(getApiBase(), creds ?? loadSourceCredentials());
+      setCapabilities(data);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Could not load capabilities");
     }
@@ -234,6 +235,22 @@ function DashboardContent() {
     const githubCheck = await ensureGitHubReady(getApiBase(), creds);
     if (!githubCheck.ok) {
       setError(githubCheck.message);
+      setLoading(false);
+      return;
+    }
+    let llmStatus = capabilities?.llm_planner;
+    if (creds.use_llm_planner) {
+      try {
+        const cap = await fetchCapabilitiesJson(getApiBase(), creds);
+        llmStatus = cap.llm_planner;
+      } catch {
+        /* use cached status */
+      }
+    }
+    if (!isLlmPlannerReady(llmStatus, creds)) {
+      setError(
+        "AI planner is enabled — add OpenRouter key and model on the landing page, or disable the toggle.",
+      );
       setLoading(false);
       return;
     }

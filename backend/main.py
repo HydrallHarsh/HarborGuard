@@ -19,13 +19,15 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from coral_mcp_client import CoralMCPClient, CoralMCPError, mcp_discovery_enabled
-from coral_client import CoralClient, CoralClientError, coral_credentials_context, get_credential, load_dotenv
+from coral_client import CoralClient, CoralClientError, get_credential, load_dotenv
 from llm_orchestrator import (
     LLMPlannerError,
+    build_llm_planner_status,
     extract_package_candidates_with_openrouter,
     plan_with_openrouter,
     build_dynamic_investigation_payload,
     openrouter_chat_tools,
+    user_settings_context,
 )
 
 
@@ -156,11 +158,14 @@ class PackageInvestigationReq(BaseModel):
 
 
 class SourceCredentials(BaseModel):
-    """Optional per-request tokens; server .env values are used when omitted."""
+    """Optional per-request tokens and LLM settings; server .env values are used when omitted."""
 
     github_token: str | None = None
     notion_api_key: str | None = None
     slack_token: str | None = None
+    openrouter_api_key: str | None = None
+    openrouter_model: str | None = None
+    use_llm_planner: bool | None = None
 
 
 class AgentInvestigationReq(SourceCredentials):
@@ -175,6 +180,17 @@ class AgentInvestigationReq(SourceCredentials):
     package_name: str | None = None
     package_version: str | None = None
     days: int = 7
+
+
+def user_settings_from_req(req: SourceCredentials):
+    return user_settings_context(
+        github_token=req.github_token,
+        notion_api_key=req.notion_api_key,
+        slack_token=req.slack_token,
+        openrouter_api_key=req.openrouter_api_key,
+        openrouter_model=req.openrouter_model,
+        use_llm_planner=req.use_llm_planner,
+    )
 
 
 REQUIRED_SOURCES = ("github", "slack", "notion", "osv", "deps_dev")
@@ -3099,11 +3115,7 @@ def agent_plan(req: AgentInvestigationReq) -> dict[str, object]:
     """Dry-run planner endpoint: discovers capabilities and returns the investigation
     plan without executing any Coral queries.  Useful for debugging and the frontend
     Coral capability panel."""
-    with coral_credentials_context(
-        github_token=req.github_token,
-        notion_api_key=req.notion_api_key,
-        slack_token=req.slack_token,
-    ):
+    with user_settings_from_req(req):
         started_at = time.perf_counter()
         logger.info(
             "endpoint.agent_plan.start owner=%s repo=%s question=%s",
@@ -3164,11 +3176,7 @@ def agent_capabilities_get() -> dict[str, object]:
 
 @app.post("/agent/capabilities")
 def agent_capabilities_post(req: SourceCredentials) -> dict[str, object]:
-    with coral_credentials_context(
-        github_token=req.github_token,
-        notion_api_key=req.notion_api_key,
-        slack_token=req.slack_token,
-    ):
+    with user_settings_from_req(req):
         return build_agent_capabilities_response()
 
 
@@ -3185,6 +3193,7 @@ def build_agent_capabilities_response() -> dict[str, object]:
         "description": "Coral metadata-derived HarborGuard investigation capabilities.",
         "required_sources": list(REQUIRED_SOURCES),
         "capabilities": capabilities,
+        "llm_planner": build_llm_planner_status(),
     }
 
 
@@ -3344,11 +3353,7 @@ def package_investigation(req: PackageInvestigationReq) -> dict[str, object]:
 
 @app.post("/agent/investigate")
 def agent_investigate(req: AgentInvestigationReq) -> dict[str, object]:
-    with coral_credentials_context(
-        github_token=req.github_token,
-        notion_api_key=req.notion_api_key,
-        slack_token=req.slack_token,
-    ):
+    with user_settings_from_req(req):
         return agent_investigate_internal(req)
 
 
@@ -3358,11 +3363,7 @@ def agent_investigate_stream(req: AgentInvestigationReq):
 
     def worker() -> None:
         try:
-            with coral_credentials_context(
-                github_token=req.github_token,
-                notion_api_key=req.notion_api_key,
-                slack_token=req.slack_token,
-            ):
+            with user_settings_from_req(req):
                 result = agent_investigate_internal(req, progress_queue=q)
                 q.put({"type": "complete", "data": result})
         except Exception as e:

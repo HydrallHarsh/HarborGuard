@@ -37,16 +37,30 @@ curl http://localhost:10000/agent/capabilities
 
 ## Environment variables
 
+### Optional server defaults (users can override in UI)
+
+| Variable | Description |
+|----------|-------------|
+| `GITHUB_TOKEN` | GitHub PAT for repo scans |
+| `NOTION_API_KEY` | Notion integration token |
+| `SLACK_TOKEN` | Slack bot/user token |
+| `HARBORGUARD_USE_LLM_PLANNER` | `true` to enable OpenRouter planner server-side |
+| `OPENROUTER_API_KEY` | OpenRouter key (`sk-or-v1-…`) |
+| `OPENROUTER_MODEL` | Model slug, e.g. `openai/gpt-oss-120b:free` |
+
+Users can paste their own tokens and OpenRouter settings in the HarborGuard landing page (saved in browser localStorage).
+
+### Deploy / host only
+
 | Variable | Required | Description |
 |----------|----------|-------------|
-| `GITHUB_TOKEN` | For GitHub scans | `gh auth token` or PAT |
-| `NOTION_API_KEY` | For Notion policy | Internal integration token |
-| `SLACK_TOKEN` | For Slack (optional) | Bot/user token |
 | `HARBORGUARD_CORS_ORIGINS` | For Vercel | Comma-separated frontend URLs |
 | `PORT` | Host sets this | Default `10000` (Render/Railway inject `PORT`) |
 | `CORAL_CONFIG_DIR` | Auto | `/data/coral-config` — mount a volume |
 | `CORAL_BIN` | Auto | `coral` on PATH after install |
 | `HARBORGUARD_USE_FIXTURES` | Demo only | `true` = canned JSON, no Coral |
+| `HARBORGUARD_DISCOVERY_BACKEND` | Optional | `sql` or `mcp` |
+| `HARBORGUARD_LOG_LEVEL` | Optional | e.g. `INFO` |
 
 ## Frontend (Vercel)
 

@@ -7,8 +7,13 @@ import { getApiBase } from "./utils/api";
 import {
   fetchCapabilities,
   isGitHubReady,
+  isLlmPlannerReady,
   loadSourceCredentials,
+  OPENROUTER_KEY_PLACEHOLDER,
+  OPENROUTER_MODEL_PLACEHOLDER,
+  RECOMMENDED_OPENROUTER_MODELS,
   saveSourceCredentials,
+  type CapabilitiesResponse,
   type SourceCredentials,
 } from "./utils/credentials";
 import {
@@ -24,11 +29,6 @@ import {
 } from "./utils/flavor";
 
 type SourceCapabilities = { available?: boolean; configured?: boolean; tools?: string[] };
-type CapabilitiesResponse = {
-  capabilities?: {
-    sources?: Record<string, SourceCapabilities>;
-  };
-};
 
 type InvestigationForm = {
   question: string; owner: string; repo: string; org: string; slack_channel: string;
@@ -143,13 +143,22 @@ export default function Home() {
   }
 
   const sources = capabilities?.capabilities?.sources ?? {};
+  const llmStatus = capabilities?.llm_planner;
   const githubReady = isGitHubReady(sources, credentials);
+  const llmReady = isLlmPlannerReady(llmStatus, credentials);
+  const canSubmit = form.question.trim() && githubReady && llmReady;
 
   function startInvestigation(e: FormEvent) {
     e.preventDefault();
     if (!form.question.trim()) return;
     if (!isGitHubReady(sources, credentials)) {
       setError("Add a GitHub token above, or use a deployment with GITHUB_TOKEN already configured.");
+      return;
+    }
+    if (!isLlmPlannerReady(llmStatus, credentials)) {
+      setError(
+        "AI planner is enabled — add your OpenRouter API key and model, or turn off the toggle.",
+      );
       return;
     }
 
@@ -268,6 +277,85 @@ export default function Home() {
             </p>
           </section>
 
+          <section className={`credPanel llmPanel ${credentials.use_llm_planner && llmReady ? "credPanelReady" : ""}`}>
+            <header className="credPanelHead">
+              <div>
+                <h3 className="credPanelTitle">AI planner (OpenRouter)</h3>
+                <p className="credPanelSub">
+                  Smarter tool selection for investigations — optional, uses your OpenRouter account.
+                </p>
+              </div>
+              <span className="credPanelBadge credPanelBadgeRec">Recommended</span>
+            </header>
+
+            <label className="llmToggle">
+              <input
+                type="checkbox"
+                checked={Boolean(credentials.use_llm_planner)}
+                onChange={e =>
+                  updateCredentials({ ...credentials, use_llm_planner: e.target.checked })
+                }
+              />
+              <span>Use AI planner (OpenRouter)</span>
+            </label>
+
+            {credentials.use_llm_planner && !llmReady && (
+              <div className="credAlert" role="status">
+                <span className="credAlertIcon" aria-hidden>!</span>
+                <p>
+                  Add an OpenRouter API key and model slug below, or configure{" "}
+                  <code>OPENROUTER_*</code> on the server.
+                </p>
+              </div>
+            )}
+
+            <div className="credGrid llmGrid">
+              <TFSecret
+                label="OpenRouter API key"
+                optional
+                value={credentials.openrouter_api_key ?? ""}
+                set={v => updateCredentials({ ...credentials, openrouter_api_key: v })}
+                ph={OPENROUTER_KEY_PLACEHOLDER}
+              />
+              <TF
+                label="OpenRouter model"
+                value={credentials.openrouter_model ?? ""}
+                set={v => updateCredentials({ ...credentials, openrouter_model: v })}
+                ph={OPENROUTER_MODEL_PLACEHOLDER}
+              />
+            </div>
+
+            <div className="recommendedModels">
+              <span className="recommendedLabel">Recommended models</span>
+              <div className="recommendedChips">
+                {RECOMMENDED_OPENROUTER_MODELS.map(m => (
+                  <button
+                    key={m.id}
+                    type="button"
+                    className="recommendedChip"
+                    title={m.note}
+                    onClick={() =>
+                      updateCredentials({ ...credentials, openrouter_model: m.id })
+                    }
+                  >
+                    <strong>{m.id}</strong>
+                    <em>{m.note}</em>
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            <p className="credFootnote">
+              Get a key at{" "}
+              <a href="https://openrouter.ai/keys" target="_blank" rel="noreferrer">
+                openrouter.ai/keys
+              </a>
+              . Model format: <code>provider/model:variant</code> (e.g.{" "}
+              <code>openai/gpt-oss-120b:free</code>). Without a key, HarborGuard uses the
+              deterministic planner.
+            </p>
+          </section>
+
           <section className="repoPanel">
             <header className="credPanelHead">
               <div>
@@ -293,11 +381,14 @@ export default function Home() {
           </section>
 
           <div className="qFormActions">
-            <button type="submit" className="qBtn" disabled={!form.question.trim() || !githubReady}>
+            <button type="submit" className="qBtn" disabled={!canSubmit}>
               Begin Investigation →
             </button>
             {!githubReady && form.question.trim() && (
               <p className="qFormHint">Connect GitHub above to continue.</p>
+            )}
+            {githubReady && credentials.use_llm_planner && !llmReady && form.question.trim() && (
+              <p className="qFormHint">Configure OpenRouter above or disable the AI planner toggle.</p>
             )}
           </div>
         </form>

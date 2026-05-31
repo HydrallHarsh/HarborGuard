@@ -5,22 +5,127 @@ import socket
 import time
 import urllib.error
 import urllib.request
+import contextvars
+from contextlib import contextmanager
 from typing import Any
 
 logger = logging.getLogger("harborguard.llm")
+
+_llm_setting_overrides: contextvars.ContextVar[dict[str, str | bool] | None] = contextvars.ContextVar(
+    "llm_setting_overrides",
+    default=None,
+)
+
+_TRUTHY = {"1", "true", "yes", "on"}
 
 
 class LLMPlannerError(RuntimeError):
     pass
 
 
+def _env_truthy(name: str, default: str = "") -> bool:
+    return os.getenv(name, default).strip().lower() in _TRUTHY
+
+
+def get_llm_setting(name: str) -> str:
+    overrides = _llm_setting_overrides.get()
+    if overrides and name in overrides:
+        value = overrides[name]
+        if isinstance(value, bool):
+            return "true" if value else "false"
+        return str(value).strip()
+    return os.getenv(name, "").strip()
+
+
+def get_llm_setting_bool(name: str, default: bool = False) -> bool:
+    raw = get_llm_setting(name)
+    if not raw:
+        return default
+    return raw.lower() in _TRUTHY
+
+
+@contextmanager
+def llm_settings_context(
+    openrouter_api_key: str | None = None,
+    openrouter_model: str | None = None,
+    use_llm_planner: bool | None = None,
+):
+    """Per-request OpenRouter / planner settings (UI-provided or server .env fallback)."""
+    overrides: dict[str, str | bool] = {}
+    if openrouter_api_key and openrouter_api_key.strip():
+        overrides["OPENROUTER_API_KEY"] = openrouter_api_key.strip()
+    if openrouter_model and openrouter_model.strip():
+        overrides["OPENROUTER_MODEL"] = openrouter_model.strip()
+    if use_llm_planner is not None:
+        overrides["HARBORGUARD_USE_LLM_PLANNER"] = use_llm_planner
+
+    if not overrides:
+        yield
+        return
+
+    reset = _llm_setting_overrides.set(overrides)
+    try:
+        yield
+    finally:
+        _llm_setting_overrides.reset(reset)
+
+
 def llm_planner_enabled() -> bool:
-    return os.getenv("HARBORGUARD_USE_LLM_PLANNER", "").lower() in {
-        "1",
-        "true",
-        "yes",
-        "on",
+    return get_llm_setting_bool("HARBORGUARD_USE_LLM_PLANNER", default=False)
+
+
+def build_llm_planner_status() -> dict[str, object]:
+    """Non-secret planner status for capabilities / UI."""
+    overrides = _llm_setting_overrides.get() or {}
+    user_key = bool(overrides.get("OPENROUTER_API_KEY"))
+    user_model = bool(overrides.get("OPENROUTER_MODEL"))
+    user_toggle = overrides.get("HARBORGUARD_USE_LLM_PLANNER")
+    server_key = bool(os.getenv("OPENROUTER_API_KEY", "").strip())
+    server_model = bool(os.getenv("OPENROUTER_MODEL", "").strip())
+    server_toggle = _env_truthy("HARBORGUARD_USE_LLM_PLANNER")
+
+    effective_model = get_llm_setting("OPENROUTER_MODEL") or None
+    configured = bool(get_llm_setting("OPENROUTER_API_KEY")) and bool(effective_model)
+    enabled = llm_planner_enabled()
+
+    if user_key or user_model or user_toggle is not None:
+        source = "user"
+    elif server_key or server_model or server_toggle:
+        source = "server"
+    else:
+        source = "off"
+
+    return {
+        "enabled": enabled,
+        "configured": configured,
+        "model": effective_model,
+        "source": source,
     }
+
+
+@contextmanager
+def user_settings_context(
+    openrouter_api_key: str | None = None,
+    openrouter_model: str | None = None,
+    use_llm_planner: bool | None = None,
+    github_token: str | None = None,
+    notion_api_key: str | None = None,
+    slack_token: str | None = None,
+):
+    """Combined Coral + LLM per-request settings."""
+    from coral_client import coral_credentials_context
+
+    with coral_credentials_context(
+        github_token=github_token,
+        notion_api_key=notion_api_key,
+        slack_token=slack_token,
+    ):
+        with llm_settings_context(
+            openrouter_api_key=openrouter_api_key,
+            openrouter_model=openrouter_model,
+            use_llm_planner=use_llm_planner,
+        ):
+            yield
 
 
 def _compact_tools(capabilities: dict[str, Any]) -> dict[str, Any]:
@@ -87,7 +192,7 @@ def openrouter_chat_json(
     started_at: float,
     log_prefix: str,
 ) -> dict[str, Any]:
-    api_key = os.getenv("OPENROUTER_API_KEY")
+    api_key = get_llm_setting("OPENROUTER_API_KEY")
     if not api_key:
         raise LLMPlannerError("OPENROUTER_API_KEY is not set")
 
@@ -154,7 +259,7 @@ def openrouter_chat_tools(
     started_at: float,
     log_prefix: str,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    api_key = os.getenv("OPENROUTER_API_KEY")
+    api_key = get_llm_setting("OPENROUTER_API_KEY")
     if not api_key:
         raise LLMPlannerError("OPENROUTER_API_KEY is not set")
 
@@ -225,7 +330,7 @@ def plan_with_openrouter(
         logger.info("llm.planner.skipped reason=disabled")
         raise LLMPlannerError("LLM planner is disabled")
 
-    model = os.getenv("OPENROUTER_MODEL")
+    model = get_llm_setting("OPENROUTER_MODEL")
     if not model:
         raise LLMPlannerError("OPENROUTER_MODEL is not set")
 
@@ -338,7 +443,7 @@ def extract_package_candidates_with_openrouter(
         logger.info("llm.extractor.skipped reason=disabled")
         raise LLMPlannerError("LLM planner is disabled")
 
-    model = os.getenv("OPENROUTER_MODEL")
+    model = get_llm_setting("OPENROUTER_MODEL")
     if not model:
         raise LLMPlannerError("OPENROUTER_MODEL is not set")
 
@@ -465,7 +570,7 @@ def build_dynamic_investigation_payload(
     if not llm_planner_enabled():
         return None
 
-    model = os.getenv("OPENROUTER_MODEL")
+    model = get_llm_setting("OPENROUTER_MODEL")
     if not model:
         return None
 
@@ -569,7 +674,7 @@ def build_verdict_with_openrouter(
             "next_action": None,
         }
 
-    model = os.getenv("OPENROUTER_MODEL")
+    model = get_llm_setting("OPENROUTER_MODEL")
     if not model:
         return {
             "verdict": "monitor",
