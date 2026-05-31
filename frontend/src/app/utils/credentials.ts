@@ -11,7 +11,18 @@ export type SourceCredentials = {
   use_llm_planner?: boolean;
 };
 
-export type SourceStatus = { available?: boolean; configured?: boolean; missing_inputs?: string[] };
+export type SourceStatus = {
+  available?: boolean;
+  configured?: boolean;
+  optional?: boolean;
+  required_for_investigation?: boolean;
+  missing_inputs?: string[];
+};
+
+export type CapabilitiesPayload = {
+  sources?: CapabilitiesSources;
+  summary?: { missing_for_investigation?: string[] };
+};
 
 export type CapabilitiesSources = Record<string, SourceStatus>;
 
@@ -26,8 +37,10 @@ export const GITHUB_REQUIRED_MESSAGE =
   "GitHub token required — run `coral source add github` with GITHUB_TOKEN to read repos.";
 
 export const SOURCES_REQUIRED_MESSAGE =
-  "Connect all Coral sources first — GitHub, Slack, and Notion tokens are required. " +
-  "Paste tokens above and click Connect Sources before investigating.";
+  "Connect sources first — GitHub token is required. Slack and Notion are optional.";
+
+export const GITHUB_CONNECT_MESSAGE =
+  "Paste a GitHub token and click Connect Sources before investigating.";
 
 export const TOKEN_SOURCE_KEYS = ["github_token", "notion_api_key", "slack_token"] as const;
 
@@ -49,6 +62,7 @@ export const RECOMMENDED_OPENROUTER_MODELS = [
 
 const STORAGE_KEY = "harborguard_source_credentials";
 const LEGACY_SESSION_KEY = STORAGE_KEY;
+const SOURCES_CONNECTED_AT_KEY = "harborguard_sources_connected_at";
 
 function readStorage(store: Storage): SourceCredentials {
   try {
@@ -127,43 +141,84 @@ export function hasAnyCredentials(credentials: SourceCredentials): boolean {
   );
 }
 
+export function hasGitHubToken(credentials: SourceCredentials): boolean {
+  return Boolean(credentials.github_token?.trim());
+}
+
 export function hasAllSourceTokens(credentials: SourceCredentials): boolean {
-  return Boolean(
-    credentials.github_token?.trim() &&
-      credentials.notion_api_key?.trim() &&
-      credentials.slack_token?.trim(),
-  );
+  return hasGitHubToken(credentials);
 }
 
 export function isGitHubReady(
   sources: CapabilitiesSources,
   credentials: SourceCredentials = loadSourceCredentials(),
 ): boolean {
-  if (credentials.github_token?.trim()) return true;
+  if (credentials.github_token?.trim()) {
+    return Boolean(sources.github?.available && sources.github?.configured);
+  }
   return Boolean(sources.github?.configured && sources.github?.available);
 }
 
-export function areTokenSourcesConfigured(sources: CapabilitiesSources): boolean {
-  return (
-    Boolean(sources.github?.configured && sources.github?.available) &&
-    Boolean(sources.slack?.configured && sources.slack?.available) &&
-    Boolean(sources.notion?.configured && sources.notion?.available)
-  );
-}
-
 export function areCommunitySourcesAvailable(sources: CapabilitiesSources): boolean {
-  return (
-    Boolean(sources.osv?.available) &&
-    Boolean(sources.deps_dev?.available)
-  );
+  return Boolean(sources.osv?.available) && Boolean(sources.deps_dev?.available);
 }
 
-/** True when all five Coral sources are registered in Coral metadata. */
+/** GitHub + osv + deps_dev — Slack/Notion optional. */
 export function areSourcesReady(
   sources: CapabilitiesSources,
   _credentials: SourceCredentials = loadSourceCredentials(),
 ): boolean {
-  return areTokenSourcesConfigured(sources) && areCommunitySourcesAvailable(sources);
+  return isGitHubReady(sources, _credentials) && areCommunitySourcesAvailable(sources);
+}
+
+export function markSourcesConnected(): void {
+  if (typeof window === "undefined") return;
+  localStorage.setItem(SOURCES_CONNECTED_AT_KEY, String(Date.now()));
+}
+
+export function clearSourcesConnectedMark(): void {
+  if (typeof window === "undefined") return;
+  localStorage.removeItem(SOURCES_CONNECTED_AT_KEY);
+}
+
+/** Reconnect Coral sources on page load when the user already connected once. */
+export async function restoreSourceConnection(
+  apiBase: string,
+  credentials: SourceCredentials = loadSourceCredentials(),
+): Promise<CapabilitiesResponse | null> {
+  const base = normalizeApiBase(apiBase);
+
+  async function fetchAndCheck(): Promise<CapabilitiesResponse | null> {
+    try {
+      const response = await fetchCapabilities(base, credentials);
+      if (!response.ok) return null;
+      const payload = (await response.json()) as CapabilitiesResponse;
+      const sources = payload?.capabilities?.sources ?? {};
+      if (areSourcesReady(sources, credentials)) {
+        markSourcesConnected();
+        return payload;
+      }
+      return payload;
+    } catch {
+      return null;
+    }
+  }
+
+  const current = await fetchAndCheck();
+  if (current && areSourcesReady(current.capabilities?.sources ?? {}, credentials)) {
+    return current;
+  }
+
+  if (!hasGitHubToken(credentials)) {
+    return current;
+  }
+
+  const connect = await connectSources(base, credentials);
+    if (connect.ok) {
+      if (connect.ready) markSourcesConnected();
+      return connect.capabilities;
+  }
+  return current;
 }
 
 export function isLlmPlannerReady(
@@ -180,9 +235,17 @@ export async function connectSources(
   apiBase: string,
   credentials: SourceCredentials = loadSourceCredentials(),
 ): Promise<
-  | { ok: true; ready: boolean; missing: string[] }
+  | {
+      ok: true;
+      ready: boolean;
+      missing: string[];
+      capabilities: CapabilitiesResponse;
+    }
   | { ok: false; message: string }
 > {
+  if (!hasGitHubToken(credentials)) {
+    return { ok: false, message: GITHUB_CONNECT_MESSAGE };
+  }
   const base = normalizeApiBase(apiBase);
   try {
     const response = await fetch(apiUrl("/agent/sources/connect", base), {
@@ -199,10 +262,16 @@ export async function connectSources(
           : detail?.message ?? `Source connect failed (${response.status})`;
       return { ok: false, message };
     }
+    if (data.ready) markSourcesConnected();
     return {
       ok: true,
       ready: Boolean(data.ready),
       missing: Array.isArray(data.missing_sources) ? data.missing_sources : [],
+      capabilities: {
+        capabilities: data.capabilities,
+        required_sources: data.required_sources,
+        optional_sources: data.optional_sources,
+      },
     };
   } catch {
     return { ok: false, message: "Could not reach the API to connect Coral sources." };
@@ -294,7 +363,9 @@ export async function fetchCapabilities(
 }
 
 export type CapabilitiesResponse = {
-  capabilities?: { sources?: CapabilitiesSources };
+  capabilities?: { sources?: CapabilitiesSources; summary?: { missing_for_investigation?: string[] } };
+  required_sources?: string[];
+  optional_sources?: string[];
   llm_planner?: LlmPlannerStatus;
 };
 

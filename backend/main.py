@@ -194,6 +194,8 @@ def user_settings_from_req(req: SourceCredentials):
 
 
 REQUIRED_SOURCES = ("github", "slack", "notion", "osv", "deps_dev")
+REQUIRED_INVESTIGATION_SOURCES = ("github", "osv", "deps_dev")
+OPTIONAL_TOKEN_SOURCES = frozenset({"slack", "notion"})
 
 BUNDLED_TOKEN_SOURCES: dict[str, str] = {
     "github": "GITHUB_TOKEN",
@@ -369,11 +371,11 @@ def connect_token_sources(required_only: bool = False) -> list[dict[str, object]
                 reason=f"{env_key} not provided",
             )
             results.append(payload)
-            if required_only:
+            if required_only and source_name == "github":
                 raise RuntimeError(
-                    f"{source_name} requires {env_key}. "
-                    f"Run `coral source add {source_name}` with the token set, "
-                    "or POST /agent/sources/connect with credentials."
+                    f"github requires {env_key}. "
+                    "Paste a GitHub token and click Connect Sources, "
+                    "or set GITHUB_TOKEN on the server."
                 )
             continue
         try:
@@ -389,44 +391,42 @@ def connect_token_sources(required_only: bool = False) -> list[dict[str, object]
         except Exception as error:
             logger.warning("sources.token.error source=%s error=%s", source_name, error)
             results.append({"source": source_name, "ok": False, "error": str(error)})
-            if required_only:
+            if required_only and source_name == "github":
                 raise
     return results
 
 
 def connect_all_coral_sources(*, required: bool = False) -> dict[str, object]:
     """Register community + token-backed Coral sources."""
-    community = ensure_community_sources()
+    ensure_community_sources()
     token_results = connect_token_sources(required_only=required)
+    # Re-register community manifests after token sources — bundled `source add`
+    # can reset Coral workspace metadata on some installs.
+    community = ensure_community_sources()
     return {
         "community": community,
         "token_sources": token_results,
         "all_ok": all(item.get("ok") for item in token_results if not item.get("skipped"))
-        and all(item.get("ok") or item.get("skipped") for item in community),
+        and all(item.get("ok") for item in community),
     }
 
 
 def sources_investigation_ready(capabilities: dict[str, object]) -> bool:
-    summary = capabilities.get("summary")
-    if not isinstance(summary, dict):
-        return False
-    unavailable = summary.get("unavailable_sources") or []
-    unconfigured = summary.get("unconfigured_sources") or []
-    return not unavailable and not unconfigured
+    return not missing_investigation_sources(capabilities)
 
 
 def missing_investigation_sources(capabilities: dict[str, object]) -> list[str]:
-    summary = capabilities.get("summary")
-    if not isinstance(summary, dict):
-        return list(REQUIRED_SOURCES)
+    sources = capabilities.get("sources")
+    if not isinstance(sources, dict):
+        return list(REQUIRED_INVESTIGATION_SOURCES)
     missing: list[str] = []
-    for key in ("unavailable_sources", "unconfigured_sources"):
-        values = summary.get(key)
-        if isinstance(values, list):
-            for source in values:
-                name = str(source)
-                if name not in missing:
-                    missing.append(name)
+    for source_name in REQUIRED_INVESTIGATION_SOURCES:
+        status = sources.get(source_name)
+        if not isinstance(status, dict):
+            missing.append(source_name)
+            continue
+        if not status.get("available") or not status.get("configured"):
+            missing.append(source_name)
     return missing
 
 
@@ -2203,16 +2203,13 @@ def require_sources_for_investigation(capabilities: dict[str, object]) -> None:
     if missing:
         names = ", ".join(missing)
         raise RuntimeError(
-            f"Coral sources not ready: {names}. "
-            "Connect all sources first — run `coral source add github|slack|notion` with tokens, "
-            "or POST /agent/sources/connect from the HarborGuard UI."
+            f"Required Coral sources not ready: {names}. "
+            "Click Connect Sources on the landing page (GitHub token required)."
         )
-    for source_name, env_key in BUNDLED_TOKEN_SOURCES.items():
-        if not get_credential(env_key):
-            raise RuntimeError(
-                f"{source_name} requires {env_key}. "
-                "Provide the token in the UI or server environment before investigating."
-            )
+    if not get_credential("GITHUB_TOKEN"):
+        raise RuntimeError(
+            "GitHub token required. Paste GITHUB_TOKEN in the UI or set it on the server."
+        )
 
 
 def require_github_for_investigation(capabilities: dict[str, object]) -> None:
@@ -2221,6 +2218,7 @@ def require_github_for_investigation(capabilities: dict[str, object]) -> None:
 
 def discover_capabilities() -> dict[str, object]:
     started_at = time.perf_counter()
+    ensure_community_sources()
     backend = "coral_mcp_with_sql_fallback" if mcp_discovery_enabled() else "coral_sql_metadata"
     logger.info("capabilities.discovery.start backend=%s", backend)
     metadata_steps = (
@@ -2322,15 +2320,31 @@ def build_capabilities(metadata_steps: list[dict[str, object]]) -> dict[str, obj
             for row in required_inputs
             if not row.get("is_set")
         ]
-        sources[source] = {
-            "available": source in source_names,
-            "inputs": source_inputs,
-            "configured": all(
-                bool(row.get("is_set"))
-                for row in required_inputs
+        env_key = BUNDLED_TOKEN_SOURCES.get(source)
+        token_provided = bool(get_credential(env_key)) if env_key else True
+        available = source in source_names
+        if source in ("osv", "deps_dev"):
+            configured = available
+        elif source == "github":
+            configured = available and (
+                token_provided
+                or all(bool(row.get("is_set")) for row in required_inputs)
             )
-            if source_inputs
-            else source in source_names,
+        elif source in OPTIONAL_TOKEN_SOURCES and not token_provided:
+            configured = True
+        elif source in OPTIONAL_TOKEN_SOURCES and token_provided:
+            configured = available
+        elif source_inputs:
+            configured = all(bool(row.get("is_set")) for row in required_inputs)
+        else:
+            configured = available
+
+        sources[source] = {
+            "available": available,
+            "optional": source in OPTIONAL_TOKEN_SOURCES,
+            "required_for_investigation": source in REQUIRED_INVESTIGATION_SOURCES,
+            "inputs": source_inputs,
+            "configured": configured,
             "missing_inputs": missing_inputs,
             "tools": [
                 tool_name
@@ -2343,7 +2357,7 @@ def build_capabilities(metadata_steps: list[dict[str, object]]) -> dict[str, obj
         "sources": sources,
         "tools": tools,
         "summary": {
-            "required_source_count": len(REQUIRED_SOURCES),
+            "required_source_count": len(REQUIRED_INVESTIGATION_SOURCES),
             "available_source_count": sum(
                 1 for source in sources.values() if source["available"]
             ),
@@ -2352,11 +2366,21 @@ def build_capabilities(metadata_steps: list[dict[str, object]]) -> dict[str, obj
             ),
             "metadata_ok": required_metadata_ok,
             "unavailable_sources": [
-                source for source, status in sources.items() if not status["available"]
+                name
+                for name in REQUIRED_INVESTIGATION_SOURCES
+                if not sources[name]["available"]
             ],
             "unconfigured_sources": [
-                source for source, status in sources.items() if not status["configured"]
+                name
+                for name in REQUIRED_INVESTIGATION_SOURCES
+                if not sources[name]["configured"]
             ],
+            "optional_sources": [
+                name
+                for name in OPTIONAL_TOKEN_SOURCES
+                if name in sources
+            ],
+            "missing_for_investigation": missing_investigation_sources({"sources": sources}),
         },
         "metadata_steps": metadata_steps,
     }
@@ -3390,19 +3414,15 @@ def connect_sources(req: SourceCredentials) -> dict[str, object]:
         logger.info("endpoint.sources_connect.start")
         missing_tokens = [
             env_key
-            for _source, env_key in BUNDLED_TOKEN_SOURCES.items()
-            if not get_credential(env_key)
+            for source, env_key in BUNDLED_TOKEN_SOURCES.items()
+            if source == "github" and not get_credential(env_key)
         ]
         if missing_tokens:
             raise HTTPException(
                 status_code=400,
                 detail={
-                    "message": "All source tokens are required before connecting.",
+                    "message": "GitHub token is required before connecting.",
                     "missing_env_keys": missing_tokens,
-                    "required": {
-                        source: env_key
-                        for source, env_key in BUNDLED_TOKEN_SOURCES.items()
-                    },
                 },
             )
         try:
@@ -3449,7 +3469,8 @@ def build_agent_capabilities_response() -> dict[str, object]:
 
     return {
         "description": "Coral metadata-derived HarborGuard investigation capabilities.",
-        "required_sources": list(REQUIRED_SOURCES),
+        "required_sources": list(REQUIRED_INVESTIGATION_SOURCES),
+        "optional_sources": list(OPTIONAL_TOKEN_SOURCES),
         "capabilities": capabilities,
         "llm_planner": build_llm_planner_status(),
     }

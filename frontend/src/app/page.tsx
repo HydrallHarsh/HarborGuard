@@ -8,17 +8,27 @@ import {
   areSourcesReady,
   connectSources,
   fetchCapabilities,
-  hasAllSourceTokens,
+  GITHUB_CONNECT_MESSAGE,
+  hasGitHubToken,
   isLlmPlannerReady,
   loadSourceCredentials,
+  markSourcesConnected,
   OPENROUTER_KEY_PLACEHOLDER,
   OPENROUTER_MODEL_PLACEHOLDER,
   RECOMMENDED_OPENROUTER_MODELS,
+  restoreSourceConnection,
   saveSourceCredentials,
   SOURCES_REQUIRED_MESSAGE,
   type CapabilitiesResponse,
   type SourceCredentials,
 } from "./utils/credentials";
+import {
+  formatHistoryWhen,
+  historyParamsToSearchParams,
+  loadInvestigationHistory,
+  removeInvestigationFromHistory,
+  type InvestigationHistoryEntry,
+} from "./utils/investigationHistory";
 import {
   DEMO_REPO,
   KONAMI_CODE,
@@ -31,7 +41,12 @@ import {
   type InvestigationMode,
 } from "./utils/flavor";
 
-type SourceCapabilities = { available?: boolean; configured?: boolean; tools?: string[] };
+type SourceCapabilities = {
+  available?: boolean;
+  configured?: boolean;
+  optional?: boolean;
+  tools?: string[];
+};
 
 type InvestigationForm = {
   question: string; owner: string; repo: string; org: string; slack_channel: string;
@@ -65,7 +80,8 @@ export default function Home() {
   const [credentials, setCredentials] = useState<SourceCredentials>({});
   const [selectedCaseId, setSelectedCaseId] = useState<InvestigationMode | null>("dep");
   const [connecting, setConnecting] = useState(false);
-  const [sourcesConnected, setSourcesConnected] = useState(false);
+  const [restoringSources, setRestoringSources] = useState(true);
+  const [history, setHistory] = useState<InvestigationHistoryEntry[]>([]);
 
   const activeMode: InvestigationMode =
     selectedCaseId &&
@@ -80,10 +96,6 @@ export default function Home() {
       if (!r.ok) throw new Error(`${r.status}`);
       const payload = (await r.json()) as CapabilitiesResponse;
       setCapabilities(payload);
-      const src = payload?.capabilities?.sources ?? {};
-      if (areSourcesReady(src, creds)) {
-        setSourcesConnected(true);
-      }
       setError(null);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Could not load capabilities");
@@ -91,9 +103,16 @@ export default function Home() {
   }
 
   useEffect(() => {
+    setHistory(loadInvestigationHistory());
     const saved = loadSourceCredentials();
     setCredentials(saved);
-    void refreshCapabilities(saved);
+    void (async () => {
+      setRestoringSources(true);
+      const restored = await restoreSourceConnection(getApiBase(), saved);
+      if (restored) setCapabilities(restored);
+      else await refreshCapabilities(saved);
+      setRestoringSources(false);
+    })();
   }, []);
 
   useEffect(() => {
@@ -154,14 +173,14 @@ export default function Home() {
 
   const sources = capabilities?.capabilities?.sources ?? {};
   const llmStatus = capabilities?.llm_planner;
-  const tokensProvided = hasAllSourceTokens(credentials);
-  const sourcesReady = areSourcesReady(sources, credentials) && sourcesConnected;
+  const githubTokenProvided = hasGitHubToken(credentials);
+  const sourcesReady = areSourcesReady(sources, credentials);
   const llmReady = isLlmPlannerReady(llmStatus, credentials);
   const canSubmit = form.question.trim() && sourcesReady && llmReady;
 
   async function handleConnectSources() {
-    if (!tokensProvided) {
-      setError(SOURCES_REQUIRED_MESSAGE);
+    if (!githubTokenProvided) {
+      setError(GITHUB_CONNECT_MESSAGE);
       return;
     }
     setConnecting(true);
@@ -171,19 +190,24 @@ export default function Home() {
     setConnecting(false);
     if (!result.ok) {
       setError(result.message);
-      setSourcesConnected(false);
       return;
     }
+    setCapabilities(result.capabilities);
+    if (result.ready) markSourcesConnected();
     if (!result.ready) {
       setError(
-        `Coral sources not fully ready${result.missing.length ? `: ${result.missing.join(", ")}` : ""}.`,
+        `Required sources not ready${result.missing.length ? `: ${result.missing.join(", ")}` : ""}.`,
       );
-      setSourcesConnected(false);
-      await refreshCapabilities(credentials);
-      return;
     }
-    setSourcesConnected(true);
-    await refreshCapabilities(credentials);
+  }
+
+  function openHistoryEntry(entry: InvestigationHistoryEntry) {
+    router.push(`/dashboard?${historyParamsToSearchParams(entry.params, entry.id).toString()}`);
+  }
+
+  function deleteHistoryEntry(id: string) {
+    removeInvestigationFromHistory(id);
+    setHistory(loadInvestigationHistory());
   }
 
   function startInvestigation(e: FormEvent) {
@@ -213,7 +237,6 @@ export default function Home() {
   function updateCredentials(next: SourceCredentials) {
     setCredentials(next);
     saveSourceCredentials(next);
-    setSourcesConnected(false);
     void refreshCapabilities(next);
   }
 
@@ -273,6 +296,41 @@ export default function Home() {
           </span>
         </button>
 
+        {history.length > 0 && (
+          <section className="historyPanel">
+            <header className="historyPanelHead">
+              <h3 className="historyPanelTitle">Recent investigations</h3>
+              <span className="historyPanelBadge">Cached locally</span>
+            </header>
+            <ul className="historyList">
+              {history.map(entry => (
+                <li key={entry.id} className="historyItem">
+                  <button type="button" className="historyItemMain" onClick={() => openHistoryEntry(entry)}>
+                    <span className={`historyRisk historyRisk-${entry.risk_level ?? "low"}`}>
+                      {(entry.risk_level ?? "low").toUpperCase()} {entry.score ?? 0}
+                    </span>
+                    <span className="historyItemBody">
+                      <strong>{entry.params.owner}/{entry.params.repo}</strong>
+                      <em>{entry.params.question}</em>
+                    </span>
+                    <span className="historyItemMeta">
+                      {formatHistoryWhen(entry.createdAt)} · {entry.findingsCount} finding(s)
+                    </span>
+                  </button>
+                  <button
+                    type="button"
+                    className="historyItemDelete"
+                    title="Remove from history"
+                    onClick={() => deleteHistoryEntry(entry.id)}
+                  >
+                    ×
+                  </button>
+                </li>
+              ))}
+            </ul>
+          </section>
+        )}
+
         <form className="qForm" onSubmit={startInvestigation}>
           <div className="qArea">
             <div className="qAreaHead">
@@ -288,7 +346,7 @@ export default function Home() {
               <div>
                 <h3 className="credPanelTitle">Source credentials</h3>
                 <p className="credPanelSub">
-                  All three tokens required — runs <code>coral source add</code> before investigating.
+                  GitHub required — Slack &amp; Notion optional. Runs <code>coral source add</code> before investigating.
                 </p>
               </div>
               <span className="credPanelBadge">Saved locally</span>
@@ -298,21 +356,21 @@ export default function Home() {
               <div className="credAlert" role="status">
                 <span className="credAlertIcon" aria-hidden>!</span>
                 <p>
-                  Paste GitHub, Slack, and Notion tokens, then click Connect Sources. HarborGuard
-                  registers each with Coral before scanning.
+                  Paste your GitHub token and click Connect Sources. Add Slack/Notion for discussion
+                  and policy context — optional for dependency scans.
                 </p>
               </div>
             )}
 
             <div className="credGrid">
               <TFSecret label="GitHub token" required value={credentials.github_token ?? ""}
-                set={v => { setSourcesConnected(false); updateCredentials({ ...credentials, github_token: v }); }}
+                set={v => updateCredentials({ ...credentials, github_token: v })}
                 ph="ghp_… or fine-grained PAT" />
-              <TFSecret label="Notion API key" required value={credentials.notion_api_key ?? ""}
-                set={v => { setSourcesConnected(false); updateCredentials({ ...credentials, notion_api_key: v }); }}
+              <TFSecret label="Notion API key" optional value={credentials.notion_api_key ?? ""}
+                set={v => updateCredentials({ ...credentials, notion_api_key: v })}
                 ph="ntn_… integration secret" />
-              <TFSecret label="Slack token" required value={credentials.slack_token ?? ""}
-                set={v => { setSourcesConnected(false); updateCredentials({ ...credentials, slack_token: v }); }}
+              <TFSecret label="Slack token" optional value={credentials.slack_token ?? ""}
+                set={v => updateCredentials({ ...credentials, slack_token: v })}
                 ph="xoxp-… or xoxb-…" />
             </div>
 
@@ -320,16 +378,15 @@ export default function Home() {
               <button
                 type="button"
                 className="qBtn qBtnSecondary"
-                disabled={!tokensProvided || connecting}
+                disabled={!githubTokenProvided || connecting}
                 onClick={() => void handleConnectSources()}
               >
-                {connecting ? "Connecting…" : sourcesConnected ? "Sources connected ✓" : "Connect Sources"}
+                {connecting ? "Connecting…" : restoringSources ? "Checking sources…" : sourcesReady ? "Sources connected ✓" : "Connect Sources"}
               </button>
             </div>
 
             <p className="credFootnote">
-              Community sources (osv, deps_dev) register automatically. Token sources map to{" "}
-              <code>GITHUB_TOKEN</code>, <code>SLACK_TOKEN</code>, <code>NOTION_API_KEY</code>.
+              osv &amp; deps_dev register automatically. Required to investigate: GitHub + osv + deps_dev.
             </p>
           </section>
 
@@ -441,7 +498,7 @@ export default function Home() {
               Begin Investigation →
             </button>
             {!sourcesReady && form.question.trim() && (
-              <p className="qFormHint">Connect all Coral sources above to continue.</p>
+              <p className="qFormHint">Connect GitHub (and wait for osv/deps_dev pills) to continue.</p>
             )}
             {sourcesReady && credentials.use_llm_planner && !llmReady && form.question.trim() && (
               <p className="qFormHint">Configure OpenRouter above or disable the AI planner toggle.</p>
@@ -452,11 +509,25 @@ export default function Home() {
         <div className="srcPills">
           {Object.entries(sources).map(([n, s]) => (
             <div key={n} className={`srcPill ${s.configured ? "on" : s.available ? "partial" : "off"}`}
-              title={s.configured ? "Connected" : s.available ? "Available — add token above" : "Unavailable"}>
-              <span className="srcDot" />{n.replace(/_/g, " ")}
+              title={
+                s.optional
+                  ? s.available
+                    ? "Optional — connected"
+                    : "Optional — not connected"
+                  : s.configured
+                    ? "Connected"
+                    : s.available
+                      ? "Available — connect GitHub"
+                      : "Unavailable"
+              }>
+              <span className="srcDot" />
+              {n.replace(/_/g, " ")}
+              {s.optional ? " (opt)" : ""}
             </div>
           ))}
-          {Object.keys(sources).length === 0 && <span className="srcLoading">Loading sources…</span>}
+          {Object.keys(sources).length === 0 && (
+            <span className="srcLoading">{restoringSources ? "Restoring sources…" : "Loading sources…"}</span>
+          )}
         </div>
 
         <p className="bFooterHint">Tip: try the demo repo, or click the title five times. We&apos;re not judging.</p>

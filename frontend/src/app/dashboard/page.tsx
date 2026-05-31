@@ -16,6 +16,11 @@ import {
   type SourceCredentials,
 } from "../utils/credentials";
 import {
+  getInvestigationById,
+  saveInvestigationToHistory,
+  type InvestigationHistoryParams,
+} from "../utils/investigationHistory";
+import {
   MODE_META,
   detectMode,
   getCompletionQuip,
@@ -156,6 +161,7 @@ function DashboardContent() {
   const package_ecosystem = searchParams.get("package_ecosystem") || "";
   const package_name = searchParams.get("package_name") || "";
   const package_version = searchParams.get("package_version") || "";
+  const historyId = searchParams.get("history") || searchParams.get("historyId") || "";
 
   const investigationMode = detectMode(question);
   const modeMeta = MODE_META[investigationMode];
@@ -214,6 +220,24 @@ function DashboardContent() {
   ]);
 
   useEffect(() => {
+    if (historyId) {
+      const entry = getInvestigationById(historyId);
+      if (entry) {
+        setResult(entry.result as InvestigationResponse);
+        setCompletionQuip(
+          getCompletionQuip(
+            entry.result.risk_level as string | undefined,
+            entry.findingsCount,
+          ),
+        );
+        setLoading(false);
+        hasRun.current = true;
+      } else {
+        setError("Cached investigation not found. It may have been cleared from this browser.");
+        setLoading(false);
+      }
+      return;
+    }
     if (hasRun.current) return;
     if (!question || !owner || !repo) {
       router.push("/");
@@ -221,7 +245,7 @@ function DashboardContent() {
     }
     hasRun.current = true;
     void runInvestigation();
-  }, [question, owner, repo, router]);
+  }, [historyId, question, owner, repo, router]);
 
   const sources = capabilities?.capabilities?.sources ?? {};
 
@@ -299,13 +323,27 @@ function DashboardContent() {
                   { ...(data as Omit<LiveQuery, "id">), id: prev.length },
                 ]);
               } else if (data.type === "complete") {
-                setResult(data.data);
+                const investigationResult = data.data as InvestigationResponse;
+                setResult(investigationResult);
                 setCompletionQuip(
                   getCompletionQuip(
-                    data.data?.risk_level,
-                    (data.data?.findings ?? []).length,
+                    investigationResult?.risk_level,
+                    (investigationResult?.findings ?? []).length,
                   ),
                 );
+                const historyParams: InvestigationHistoryParams = {
+                  question,
+                  owner,
+                  repo,
+                  org: org || owner,
+                  slack_channel,
+                  policy_query,
+                  package_system,
+                  package_ecosystem,
+                  package_name,
+                  package_version,
+                };
+                saveInvestigationToHistory(historyParams, investigationResult as Record<string, unknown>);
                 setLoading(false);
                 receivedComplete = true;
               } else if (data.type === "error") {
@@ -421,8 +459,11 @@ function DashboardContent() {
               Coral Schema Intelligence
             </button>
             <button className="tbBtn" onClick={() => router.push("/")}>
-              ← New Investigation
+              ← Home
             </button>
+            {historyId && (
+              <span className="tbCachedBadge" title="Loaded from browser cache">Cached</span>
+            )}
           </div>
         </header>
 
