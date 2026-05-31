@@ -195,6 +195,14 @@ def user_settings_from_req(req: SourceCredentials):
 
 REQUIRED_SOURCES = ("github", "slack", "notion", "osv", "deps_dev")
 
+BUNDLED_TOKEN_SOURCES: dict[str, str] = {
+    "github": "GITHUB_TOKEN",
+    "slack": "SLACK_TOKEN",
+    "notion": "NOTION_API_KEY",
+}
+
+INVESTIGATION_TOKEN_SOURCES = ("github", "slack", "notion")
+
 INVESTIGATION_TOOLS = {
     "github.pulls": {
         "source": "github",
@@ -224,10 +232,10 @@ INVESTIGATION_TOOLS = {
         "capabilities": ["secret_file_search"],
         "step": "github_secret_file_search",
     },
-    "github.file": {
+    "github.contents": {
         "source": "github",
-        "kind": "table_function",
-        "purpose": "Fetch raw file content from a repository path.",
+        "kind": "table",
+        "purpose": "Fetch repository file content (e.g. package.json).",
         "capabilities": ["manifest_reading"],
         "step": "github_file_content",
     },
@@ -274,6 +282,152 @@ INVESTIGATION_TOOLS = {
         "step": "slack_security_discussion",
     },
 }
+
+
+def harborguard_root() -> Path:
+    return Path(__file__).resolve().parent.parent
+
+
+def community_source_manifests() -> list[tuple[str, Path]]:
+    """Resolve osv/deps_dev manifest paths (local checkout or Docker image)."""
+    manifests: list[tuple[str, Path]] = []
+    for source_name in ("osv", "deps_dev"):
+        candidates = [
+            harborguard_root() / "coral-sources" / "community" / source_name / "manifest.yaml",
+            Path(f"/opt/coral-sources/community/{source_name}/manifest.yaml"),
+        ]
+        for path in candidates:
+            if path.is_file():
+                manifests.append((source_name, path))
+                break
+    return manifests
+
+
+def connect_result_payload(
+    source: str,
+    result: object,
+    *,
+    skipped: bool = False,
+    reason: str | None = None,
+) -> dict[str, object]:
+    if skipped:
+        return {"source": source, "ok": False, "skipped": True, "reason": reason}
+    from coral_client import CoralCommandResult
+
+    if not isinstance(result, CoralCommandResult):
+        return {"source": source, "ok": False, "error": "unexpected result type"}
+    ok = result.returncode == 0
+    message = (result.stderr or result.stdout or "").strip()
+    return {
+        "source": source,
+        "ok": ok,
+        "returncode": result.returncode,
+        "stdout": result.stdout.strip() if result.stdout else "",
+        "stderr": result.stderr.strip() if result.stderr else "",
+        "message": compact_text(message, 500),
+    }
+
+
+def ensure_community_sources() -> list[dict[str, object]]:
+    """Register osv and deps_dev community manifests (no tokens required)."""
+    results: list[dict[str, object]] = []
+    for source_name, manifest_path in community_source_manifests():
+        try:
+            result = coral.source_add_file(str(manifest_path))
+            payload = connect_result_payload(source_name, result)
+            if not payload["ok"]:
+                logger.warning(
+                    "sources.community.failed source=%s path=%s message=%s",
+                    source_name,
+                    manifest_path,
+                    payload.get("message"),
+                )
+            else:
+                logger.info("sources.community.ok source=%s path=%s", source_name, manifest_path)
+            results.append(payload)
+        except Exception as error:
+            logger.warning(
+                "sources.community.error source=%s path=%s error=%s",
+                source_name,
+                manifest_path,
+                error,
+            )
+            results.append({"source": source_name, "ok": False, "error": str(error)})
+    return results
+
+
+def connect_token_sources(required_only: bool = False) -> list[dict[str, object]]:
+    """Run `coral source add` for bundled sources when credentials are present."""
+    results: list[dict[str, object]] = []
+    for source_name, env_key in BUNDLED_TOKEN_SOURCES.items():
+        token = get_credential(env_key)
+        if not token:
+            payload = connect_result_payload(
+                source_name,
+                None,
+                skipped=True,
+                reason=f"{env_key} not provided",
+            )
+            results.append(payload)
+            if required_only:
+                raise RuntimeError(
+                    f"{source_name} requires {env_key}. "
+                    f"Run `coral source add {source_name}` with the token set, "
+                    "or POST /agent/sources/connect with credentials."
+                )
+            continue
+        try:
+            result = coral.source_add(source_name)
+            payload = connect_result_payload(source_name, result)
+            if not payload["ok"]:
+                raise RuntimeError(
+                    payload.get("message")
+                    or f"coral source add {source_name} failed (exit {payload.get('returncode')})"
+                )
+            logger.info("sources.token.ok source=%s", source_name)
+            results.append(payload)
+        except Exception as error:
+            logger.warning("sources.token.error source=%s error=%s", source_name, error)
+            results.append({"source": source_name, "ok": False, "error": str(error)})
+            if required_only:
+                raise
+    return results
+
+
+def connect_all_coral_sources(*, required: bool = False) -> dict[str, object]:
+    """Register community + token-backed Coral sources."""
+    community = ensure_community_sources()
+    token_results = connect_token_sources(required_only=required)
+    return {
+        "community": community,
+        "token_sources": token_results,
+        "all_ok": all(item.get("ok") for item in token_results if not item.get("skipped"))
+        and all(item.get("ok") or item.get("skipped") for item in community),
+    }
+
+
+def sources_investigation_ready(capabilities: dict[str, object]) -> bool:
+    summary = capabilities.get("summary")
+    if not isinstance(summary, dict):
+        return False
+    unavailable = summary.get("unavailable_sources") or []
+    unconfigured = summary.get("unconfigured_sources") or []
+    return not unavailable and not unconfigured
+
+
+def missing_investigation_sources(capabilities: dict[str, object]) -> list[str]:
+    summary = capabilities.get("summary")
+    if not isinstance(summary, dict):
+        return list(REQUIRED_SOURCES)
+    missing: list[str] = []
+    for key in ("unavailable_sources", "unconfigured_sources"):
+        values = summary.get(key)
+        if isinstance(values, list):
+            for source in values:
+                name = str(source)
+                if name not in missing:
+                    missing.append(name)
+    return missing
 
 
 def sql_string(value: str) -> str:
@@ -827,7 +981,7 @@ def extract_candidates_from_manifest(
                 "ecosystem": ecosystem,
                 "system": "NPM",
                 "confidence": 0.95,
-                "source": "github.file",
+                "source": "github.contents",
                 "reason": "Found in package.json dependencies.",
                 "evidence": {"url": source_url},
             })
@@ -1187,6 +1341,43 @@ def fetch_github_raw_file(
     return None
 
 
+def fetch_manifest_via_coral(
+    owner: str,
+    repo: str,
+    path: str,
+) -> tuple[str, str] | None:
+    owner_ref = sql_string(owner)
+    repo_ref = sql_string(repo)
+    path_ref = sql_string(path.lstrip("/"))
+    sql = f"""
+    SELECT content_text, path, html_url
+    FROM github.contents
+    WHERE owner = '{owner_ref}'
+      AND repo = '{repo_ref}'
+      AND path = '{path_ref}'
+    LIMIT 1
+    """
+    try:
+        result = coral.query(sql, timeout_seconds=github_query_timeout())
+    except CoralClientError as error:
+        logger.warning(
+            "manifest.coral.failed owner=%s repo=%s path=%s error=%s",
+            owner,
+            repo,
+            path,
+            compact_text(str(error)),
+        )
+        return None
+    if not result.rows:
+        return None
+    row = result.rows[0]
+    content = row.get("content_text") or row.get("content")
+    if not content:
+        return None
+    url = str(row.get("html_url") or f"https://github.com/{owner}/{repo}/blob/HEAD/{path.lstrip('/')}")
+    return str(content), url
+
+
 def fetch_manifest_candidates(owner: str, repo: str) -> list[dict[str, object]]:
     manifest_paths = (
         "package.json",
@@ -1195,7 +1386,9 @@ def fetch_manifest_candidates(owner: str, repo: str) -> list[dict[str, object]]:
         "packages/app/package.json",
     )
     for manifest_path in manifest_paths:
-        fetched = fetch_github_raw_file(owner, repo, manifest_path)
+        fetched = fetch_manifest_via_coral(owner, repo, manifest_path)
+        if not fetched and env_truthy("HARBORGUARD_GITHUB_RAW_FALLBACK"):
+            fetched = fetch_github_raw_file(owner, repo, manifest_path)
         if not fetched:
             continue
         content, url = fetched
@@ -2000,18 +2193,30 @@ def github_source_configured(capabilities: dict[str, object]) -> bool:
     if not isinstance(sources, dict):
         return bool(get_credential("GITHUB_TOKEN"))
     github = sources.get("github")
-    if isinstance(github, dict) and github.get("configured"):
+    if isinstance(github, dict) and github.get("configured") and github.get("available"):
         return True
-    return bool(get_credential("GITHUB_TOKEN"))
+    return False
+
+
+def require_sources_for_investigation(capabilities: dict[str, object]) -> None:
+    missing = missing_investigation_sources(capabilities)
+    if missing:
+        names = ", ".join(missing)
+        raise RuntimeError(
+            f"Coral sources not ready: {names}. "
+            "Connect all sources first — run `coral source add github|slack|notion` with tokens, "
+            "or POST /agent/sources/connect from the HarborGuard UI."
+        )
+    for source_name, env_key in BUNDLED_TOKEN_SOURCES.items():
+        if not get_credential(env_key):
+            raise RuntimeError(
+                f"{source_name} requires {env_key}. "
+                "Provide the token in the UI or server environment before investigating."
+            )
 
 
 def require_github_for_investigation(capabilities: dict[str, object]) -> None:
-    if github_source_configured(capabilities):
-        return
-    raise RuntimeError(
-        "GitHub is not configured. Coral requires GITHUB_TOKEN to scan repositories. "
-        "Add github_token in the request body or set GITHUB_TOKEN in the server environment."
-    )
+    require_sources_for_investigation(capabilities)
 
 
 def discover_capabilities() -> dict[str, object]:
@@ -3105,6 +3310,14 @@ def build_assessment_answer(
     )
 
 
+@app.on_event("startup")
+def startup_ensure_community_sources() -> None:
+    try:
+        ensure_community_sources()
+    except Exception as error:
+        logger.warning("startup.community_sources.failed error=%s", error)
+
+
 @app.get("/")
 def read_root() -> dict[str, str]:
     return {"name": "HarborGuard", "status": "READY"}
@@ -3167,6 +3380,51 @@ def sources() -> dict[str, object]:
         ],
         "sql": result.sql,
     }
+
+
+@app.post("/agent/sources/connect")
+def connect_sources(req: SourceCredentials) -> dict[str, object]:
+    """Run `coral source add` for all provided tokens plus community osv/deps_dev manifests."""
+    with user_settings_from_req(req):
+        started_at = time.perf_counter()
+        logger.info("endpoint.sources_connect.start")
+        missing_tokens = [
+            env_key
+            for _source, env_key in BUNDLED_TOKEN_SOURCES.items()
+            if not get_credential(env_key)
+        ]
+        if missing_tokens:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "message": "All source tokens are required before connecting.",
+                    "missing_env_keys": missing_tokens,
+                    "required": {
+                        source: env_key
+                        for source, env_key in BUNDLED_TOKEN_SOURCES.items()
+                    },
+                },
+            )
+        try:
+            connect_payload = connect_all_coral_sources(required=True)
+        except RuntimeError as error:
+            raise HTTPException(status_code=502, detail=str(error)) from error
+        capabilities = discover_capabilities()
+        ready = sources_investigation_ready(capabilities)
+        duration_ms = elapsed_ms(started_at)
+        logger.info(
+            "endpoint.sources_connect.done duration_ms=%s ready=%s missing=%s",
+            duration_ms,
+            ready,
+            missing_investigation_sources(capabilities),
+        )
+        return {
+            "connect": connect_payload,
+            "ready": ready,
+            "missing_sources": missing_investigation_sources(capabilities),
+            "capabilities": capabilities,
+            "duration_ms": duration_ms,
+        }
 
 
 @app.get("/agent/capabilities")
@@ -3448,9 +3706,14 @@ def agent_investigate_internal(
             req.repo,
             secrets_focus=question_intent["secrets"],
         )
+        emit("Connecting Coral sources (github, slack, notion, osv, deps_dev)...")
+        try:
+            connect_all_coral_sources(required=True)
+        except RuntimeError as error:
+            raise RuntimeError(str(error)) from error
         emit("Discovering capabilities and connected sources...")
         capabilities = discover_capabilities()
-        require_github_for_investigation(capabilities)
+        require_sources_for_investigation(capabilities)
         emit(f"Discovered {len(capabilities.get('tools', []))} available tools")
         metadata_steps = capabilities.get("metadata_steps", [])
         emit("Planning investigation...")
@@ -3740,18 +4003,24 @@ def agent_investigate_internal(
                     try:
                         started_at_q = time.perf_counter()
                     
-                        if original_name == "github.file":
+                        if original_name in ("github.file", "github.contents"):
                             owner = str(args.get("owner", req.owner))
                             repo = str(args.get("repo", req.repo))
                             path = str(args.get("path", "package.json"))
-                            fetched = fetch_github_raw_file(owner, repo, path)
+                            fetched = fetch_manifest_via_coral(owner, repo, path)
                             if not fetched:
-                                raise CoralClientError(f"Could not fetch {path} from {owner}/{repo}")
+                                raise CoralClientError(
+                                    f"Could not fetch {path} from {owner}/{repo} via github.contents"
+                                )
                             content, url = fetched
                             logger.info("agent.dynamic_tool.start name=%s url=%s", step_name, url)
                             candidates = extract_candidates_from_manifest(content, "npm", url)
                             result_rows = [{"content": content, "candidates": candidates}]
-                            sql_executed = f"bypass: github raw API ({url})"
+                            sql_executed = (
+                                f"SELECT content_text FROM github.contents "
+                                f"WHERE owner = '{sql_string(owner)}' AND repo = '{sql_string(repo)}' "
+                                f"AND path = '{sql_string(path)}'"
+                            )
                             duration_ms = elapsed_ms(started_at_q)
                         else:
                             logger.info("agent.dynamic_tool.start name=%s sql=%s", step_name, compact_sql(sql))

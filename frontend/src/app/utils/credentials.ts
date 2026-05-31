@@ -23,8 +23,13 @@ export type LlmPlannerStatus = {
 };
 
 export const GITHUB_REQUIRED_MESSAGE =
-  "GitHub token required — Coral needs GITHUB_TOKEN to read repos (PRs, commits, code search). " +
-  "Paste your PAT above, or use a deployment where the server already has GITHUB_TOKEN set.";
+  "GitHub token required — run `coral source add github` with GITHUB_TOKEN to read repos.";
+
+export const SOURCES_REQUIRED_MESSAGE =
+  "Connect all Coral sources first — GitHub, Slack, and Notion tokens are required. " +
+  "Paste tokens above and click Connect Sources before investigating.";
+
+export const TOKEN_SOURCE_KEYS = ["github_token", "notion_api_key", "slack_token"] as const;
 
 export const OPENROUTER_KEY_PLACEHOLDER = "sk-or-v1-…";
 export const OPENROUTER_MODEL_PLACEHOLDER = "provider/model:variant";
@@ -122,12 +127,43 @@ export function hasAnyCredentials(credentials: SourceCredentials): boolean {
   );
 }
 
+export function hasAllSourceTokens(credentials: SourceCredentials): boolean {
+  return Boolean(
+    credentials.github_token?.trim() &&
+      credentials.notion_api_key?.trim() &&
+      credentials.slack_token?.trim(),
+  );
+}
+
 export function isGitHubReady(
   sources: CapabilitiesSources,
   credentials: SourceCredentials = loadSourceCredentials(),
 ): boolean {
   if (credentials.github_token?.trim()) return true;
-  return Boolean(sources.github?.configured);
+  return Boolean(sources.github?.configured && sources.github?.available);
+}
+
+export function areTokenSourcesConfigured(sources: CapabilitiesSources): boolean {
+  return (
+    Boolean(sources.github?.configured && sources.github?.available) &&
+    Boolean(sources.slack?.configured && sources.slack?.available) &&
+    Boolean(sources.notion?.configured && sources.notion?.available)
+  );
+}
+
+export function areCommunitySourcesAvailable(sources: CapabilitiesSources): boolean {
+  return (
+    Boolean(sources.osv?.available) &&
+    Boolean(sources.deps_dev?.available)
+  );
+}
+
+/** True when all five Coral sources are registered in Coral metadata. */
+export function areSourcesReady(
+  sources: CapabilitiesSources,
+  _credentials: SourceCredentials = loadSourceCredentials(),
+): boolean {
+  return areTokenSourcesConfigured(sources) && areCommunitySourcesAvailable(sources);
 }
 
 export function isLlmPlannerReady(
@@ -138,6 +174,84 @@ export function isLlmPlannerReady(
   if (credentials.openrouter_api_key?.trim() && credentials.openrouter_model?.trim()) return true;
   if (llmStatus?.configured) return true;
   return false;
+}
+
+export async function connectSources(
+  apiBase: string,
+  credentials: SourceCredentials = loadSourceCredentials(),
+): Promise<
+  | { ok: true; ready: boolean; missing: string[] }
+  | { ok: false; message: string }
+> {
+  const base = normalizeApiBase(apiBase);
+  try {
+    const response = await fetch(apiUrl("/agent/sources/connect", base), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(credentialsPayload(credentials)),
+    });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      const detail = data.detail;
+      const message =
+        typeof detail === "string"
+          ? detail
+          : detail?.message ?? `Source connect failed (${response.status})`;
+      return { ok: false, message };
+    }
+    return {
+      ok: true,
+      ready: Boolean(data.ready),
+      missing: Array.isArray(data.missing_sources) ? data.missing_sources : [],
+    };
+  } catch {
+    return { ok: false, message: "Could not reach the API to connect Coral sources." };
+  }
+}
+
+export async function ensureSourcesReady(
+  apiBase: string,
+  credentials: SourceCredentials = loadSourceCredentials(),
+): Promise<
+  | { ok: true; sources: CapabilitiesSources }
+  | { ok: false; message: string }
+> {
+  const base = normalizeApiBase(apiBase);
+  try {
+    const response = await fetchCapabilities(base, credentials);
+    if (response.ok) {
+      const payload = await response.json();
+      const sources = (payload?.capabilities?.sources ?? {}) as CapabilitiesSources;
+      if (areSourcesReady(sources, credentials)) {
+        return { ok: true, sources };
+      }
+    }
+  } catch {
+    /* fall through to connect */
+  }
+
+  const connect = await connectSources(base, credentials);
+  if (!connect.ok) {
+    return { ok: false, message: connect.message };
+  }
+  if (!connect.ready) {
+    const missing = connect.missing.length ? connect.missing.join(", ") : "unknown";
+    return {
+      ok: false,
+      message: `Sources still not ready after connect: ${missing}. Check tokens and retry.`,
+    };
+  }
+  try {
+    const response = await fetchCapabilities(base, credentials);
+    if (!response.ok) {
+      return { ok: false, message: `Could not verify sources (${response.status}).` };
+    }
+    const payload = await response.json();
+    const sources = (payload?.capabilities?.sources ?? {}) as CapabilitiesSources;
+    return { ok: true, sources };
+  } catch {
+    return { ok: false, message: "Could not reach the API to verify connected sources." };
+  }
 }
 
 export async function ensureGitHubReady(

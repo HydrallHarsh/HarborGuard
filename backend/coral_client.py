@@ -234,6 +234,64 @@ class CoralClient:
             stderr=completed.stderr,
         )
 
+    def source_add(self, source_name: str, timeout_seconds: float | None = None) -> CoralCommandResult:
+        """Register a bundled Coral source (github, slack, notion). Reads tokens from env."""
+        timeout = timeout_seconds or self.timeout_seconds
+        started_at = time.perf_counter()
+        logger.info("coral.source_add.start source=%s timeout=%ss", source_name, f"{timeout:g}")
+        completed = subprocess.run(
+            [self.coral_bin, "source", "add", source_name],
+            env=coral_env(self.config_dir),
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=timeout,
+        )
+        logger.info(
+            "coral.source_add.done source=%s duration_ms=%s returncode=%s",
+            source_name,
+            elapsed_ms(started_at),
+            completed.returncode,
+        )
+        return CoralCommandResult(
+            returncode=completed.returncode,
+            stdout=completed.stdout,
+            stderr=completed.stderr,
+        )
+
+    def source_add_file(
+        self,
+        manifest_path: str,
+        timeout_seconds: float | None = None,
+    ) -> CoralCommandResult:
+        """Register a community source from a manifest YAML file."""
+        timeout = timeout_seconds or self.timeout_seconds
+        started_at = time.perf_counter()
+        logger.info(
+            "coral.source_add_file.start path=%s timeout=%ss",
+            manifest_path,
+            f"{timeout:g}",
+        )
+        completed = subprocess.run(
+            [self.coral_bin, "source", "add", "--file", manifest_path],
+            env=coral_env(self.config_dir),
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=timeout,
+        )
+        logger.info(
+            "coral.source_add_file.done path=%s duration_ms=%s returncode=%s",
+            manifest_path,
+            elapsed_ms(started_at),
+            completed.returncode,
+        )
+        return CoralCommandResult(
+            returncode=completed.returncode,
+            stdout=completed.stdout,
+            stderr=completed.stderr,
+        )
+
 
 def elapsed_ms(started_at: float) -> int:
     return round((time.perf_counter() - started_at) * 1000)

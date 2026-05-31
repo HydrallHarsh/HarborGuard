@@ -9,7 +9,7 @@ import { SchemaPanel } from "../components/SchemaPanel";
 import { apiUrl, getApiBase } from "../utils/api";
 import {
   credentialsPayload,
-  ensureGitHubReady,
+  ensureSourcesReady,
   fetchCapabilitiesJson,
   isLlmPlannerReady,
   loadSourceCredentials,
@@ -232,9 +232,9 @@ function DashboardContent() {
     setLiveSteps(["Initializing investigation..."]);
     setLiveQueries([]);
     const creds = loadSourceCredentials();
-    const githubCheck = await ensureGitHubReady(getApiBase(), creds);
-    if (!githubCheck.ok) {
-      setError(githubCheck.message);
+    const sourceCheck = await ensureSourcesReady(getApiBase(), creds);
+    if (!sourceCheck.ok) {
+      setError(sourceCheck.message);
       setLoading(false);
       return;
     }

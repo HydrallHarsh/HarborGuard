@@ -5,14 +5,17 @@ import { motion, AnimatePresence } from "motion/react";
 import { useRouter } from "next/navigation";
 import { getApiBase } from "./utils/api";
 import {
+  areSourcesReady,
+  connectSources,
   fetchCapabilities,
-  isGitHubReady,
+  hasAllSourceTokens,
   isLlmPlannerReady,
   loadSourceCredentials,
   OPENROUTER_KEY_PLACEHOLDER,
   OPENROUTER_MODEL_PLACEHOLDER,
   RECOMMENDED_OPENROUTER_MODELS,
   saveSourceCredentials,
+  SOURCES_REQUIRED_MESSAGE,
   type CapabilitiesResponse,
   type SourceCredentials,
 } from "./utils/credentials";
@@ -61,6 +64,8 @@ export default function Home() {
   const [konamiIdx, setKonamiIdx] = useState(0);
   const [credentials, setCredentials] = useState<SourceCredentials>({});
   const [selectedCaseId, setSelectedCaseId] = useState<InvestigationMode | null>("dep");
+  const [connecting, setConnecting] = useState(false);
+  const [sourcesConnected, setSourcesConnected] = useState(false);
 
   const activeMode: InvestigationMode =
     selectedCaseId &&
@@ -73,7 +78,12 @@ export default function Home() {
     try {
       const r = await fetchCapabilities(getApiBase(), creds);
       if (!r.ok) throw new Error(`${r.status}`);
-      setCapabilities(await r.json());
+      const payload = (await r.json()) as CapabilitiesResponse;
+      setCapabilities(payload);
+      const src = payload?.capabilities?.sources ?? {};
+      if (areSourcesReady(src, creds)) {
+        setSourcesConnected(true);
+      }
       setError(null);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Could not load capabilities");
@@ -144,15 +154,43 @@ export default function Home() {
 
   const sources = capabilities?.capabilities?.sources ?? {};
   const llmStatus = capabilities?.llm_planner;
-  const githubReady = isGitHubReady(sources, credentials);
+  const tokensProvided = hasAllSourceTokens(credentials);
+  const sourcesReady = areSourcesReady(sources, credentials) && sourcesConnected;
   const llmReady = isLlmPlannerReady(llmStatus, credentials);
-  const canSubmit = form.question.trim() && githubReady && llmReady;
+  const canSubmit = form.question.trim() && sourcesReady && llmReady;
+
+  async function handleConnectSources() {
+    if (!tokensProvided) {
+      setError(SOURCES_REQUIRED_MESSAGE);
+      return;
+    }
+    setConnecting(true);
+    setError(null);
+    saveSourceCredentials(credentials);
+    const result = await connectSources(getApiBase(), credentials);
+    setConnecting(false);
+    if (!result.ok) {
+      setError(result.message);
+      setSourcesConnected(false);
+      return;
+    }
+    if (!result.ready) {
+      setError(
+        `Coral sources not fully ready${result.missing.length ? `: ${result.missing.join(", ")}` : ""}.`,
+      );
+      setSourcesConnected(false);
+      await refreshCapabilities(credentials);
+      return;
+    }
+    setSourcesConnected(true);
+    await refreshCapabilities(credentials);
+  }
 
   function startInvestigation(e: FormEvent) {
     e.preventDefault();
     if (!form.question.trim()) return;
-    if (!isGitHubReady(sources, credentials)) {
-      setError("Add a GitHub token above, or use a deployment with GITHUB_TOKEN already configured.");
+    if (!sourcesReady) {
+      setError(SOURCES_REQUIRED_MESSAGE);
       return;
     }
     if (!isLlmPlannerReady(llmStatus, credentials)) {
@@ -175,6 +213,7 @@ export default function Home() {
   function updateCredentials(next: SourceCredentials) {
     setCredentials(next);
     saveSourceCredentials(next);
+    setSourcesConnected(false);
     void refreshCapabilities(next);
   }
 
@@ -244,36 +283,53 @@ export default function Home() {
               placeholder="Ask a security question..." rows={3} />
           </div>
 
-          <section className={`credPanel ${githubReady ? "credPanelReady" : "credPanelNeedsAuth"}`}>
+          <section className={`credPanel ${sourcesReady ? "credPanelReady" : "credPanelNeedsAuth"}`}>
             <header className="credPanelHead">
               <div>
                 <h3 className="credPanelTitle">Source credentials</h3>
-                <p className="credPanelSub">Connect your tools — saved in this browser, never in the URL.</p>
+                <p className="credPanelSub">
+                  All three tokens required — runs <code>coral source add</code> before investigating.
+                </p>
               </div>
               <span className="credPanelBadge">Saved locally</span>
             </header>
 
-            {!githubReady && (
+            {!sourcesReady && (
               <div className="credAlert" role="status">
                 <span className="credAlertIcon" aria-hidden>!</span>
-                <p>Add a GitHub token to scan repositories. Notion and Slack are optional.</p>
+                <p>
+                  Paste GitHub, Slack, and Notion tokens, then click Connect Sources. HarborGuard
+                  registers each with Coral before scanning.
+                </p>
               </div>
             )}
 
             <div className="credGrid">
               <TFSecret label="GitHub token" required value={credentials.github_token ?? ""}
-                set={v => updateCredentials({ ...credentials, github_token: v })}
+                set={v => { setSourcesConnected(false); updateCredentials({ ...credentials, github_token: v }); }}
                 ph="ghp_… or fine-grained PAT" />
-              <TFSecret label="Notion API key" optional value={credentials.notion_api_key ?? ""}
-                set={v => updateCredentials({ ...credentials, notion_api_key: v })}
+              <TFSecret label="Notion API key" required value={credentials.notion_api_key ?? ""}
+                set={v => { setSourcesConnected(false); updateCredentials({ ...credentials, notion_api_key: v }); }}
                 ph="ntn_… integration secret" />
-              <TFSecret label="Slack token" optional value={credentials.slack_token ?? ""}
-                set={v => updateCredentials({ ...credentials, slack_token: v })}
+              <TFSecret label="Slack token" required value={credentials.slack_token ?? ""}
+                set={v => { setSourcesConnected(false); updateCredentials({ ...credentials, slack_token: v }); }}
                 ph="xoxp-… or xoxb-…" />
             </div>
 
+            <div className="qFormActions">
+              <button
+                type="button"
+                className="qBtn qBtnSecondary"
+                disabled={!tokensProvided || connecting}
+                onClick={() => void handleConnectSources()}
+              >
+                {connecting ? "Connecting…" : sourcesConnected ? "Sources connected ✓" : "Connect Sources"}
+              </button>
+            </div>
+
             <p className="credFootnote">
-              Server deployments can set <code>GITHUB_TOKEN</code> in the environment — if the GitHub pill below is green, you can skip pasting your own.
+              Community sources (osv, deps_dev) register automatically. Token sources map to{" "}
+              <code>GITHUB_TOKEN</code>, <code>SLACK_TOKEN</code>, <code>NOTION_API_KEY</code>.
             </p>
           </section>
 
@@ -384,10 +440,10 @@ export default function Home() {
             <button type="submit" className="qBtn" disabled={!canSubmit}>
               Begin Investigation →
             </button>
-            {!githubReady && form.question.trim() && (
-              <p className="qFormHint">Connect GitHub above to continue.</p>
+            {!sourcesReady && form.question.trim() && (
+              <p className="qFormHint">Connect all Coral sources above to continue.</p>
             )}
-            {githubReady && credentials.use_llm_planner && !llmReady && form.question.trim() && (
+            {sourcesReady && credentials.use_llm_planner && !llmReady && form.question.trim() && (
               <p className="qFormHint">Configure OpenRouter above or disable the AI planner toggle.</p>
             )}
           </div>
