@@ -1,0 +1,123 @@
+/** Per-user source tokens — kept in localStorage, never URL query params. */
+
+export type SourceCredentials = {
+  github_token?: string;
+  notion_api_key?: string;
+  slack_token?: string;
+};
+
+export type SourceStatus = { available?: boolean; configured?: boolean; missing_inputs?: string[] };
+
+export type CapabilitiesSources = Record<string, SourceStatus>;
+
+export const GITHUB_REQUIRED_MESSAGE =
+  "GitHub token required — Coral needs GITHUB_TOKEN to read repos (PRs, commits, code search). " +
+  "Paste your PAT above, or use a deployment where the server already has GITHUB_TOKEN set.";
+
+const STORAGE_KEY = "harborguard_source_credentials";
+const LEGACY_SESSION_KEY = STORAGE_KEY;
+
+function readStorage(store: Storage): SourceCredentials {
+  try {
+    const raw = store.getItem(STORAGE_KEY);
+    if (!raw) return {};
+    const parsed = JSON.parse(raw) as SourceCredentials;
+    return parsed && typeof parsed === "object" ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+function writeStorage(store: Storage, credentials: SourceCredentials): void {
+  const trimmed: SourceCredentials = {};
+  if (credentials.github_token?.trim()) trimmed.github_token = credentials.github_token.trim();
+  if (credentials.notion_api_key?.trim()) trimmed.notion_api_key = credentials.notion_api_key.trim();
+  if (credentials.slack_token?.trim()) trimmed.slack_token = credentials.slack_token.trim();
+  if (Object.keys(trimmed).length === 0) {
+    store.removeItem(STORAGE_KEY);
+  } else {
+    store.setItem(STORAGE_KEY, JSON.stringify(trimmed));
+  }
+}
+
+export function loadSourceCredentials(): SourceCredentials {
+  if (typeof window === "undefined") return {};
+
+  const local = readStorage(localStorage);
+  if (Object.keys(local).length > 0) return local;
+
+  // One-time migration from sessionStorage (older builds).
+  const session = readStorage(sessionStorage);
+  if (Object.keys(session).length > 0) {
+    writeStorage(localStorage, session);
+    sessionStorage.removeItem(LEGACY_SESSION_KEY);
+    return session;
+  }
+
+  return {};
+}
+
+export function saveSourceCredentials(credentials: SourceCredentials): void {
+  if (typeof window === "undefined") return;
+  writeStorage(localStorage, credentials);
+  sessionStorage.removeItem(LEGACY_SESSION_KEY);
+}
+
+export function credentialsPayload(credentials: SourceCredentials) {
+  const body: Record<string, string> = {};
+  if (credentials.github_token) body.github_token = credentials.github_token;
+  if (credentials.notion_api_key) body.notion_api_key = credentials.notion_api_key;
+  if (credentials.slack_token) body.slack_token = credentials.slack_token;
+  return body;
+}
+
+export function hasAnyCredentials(credentials: SourceCredentials): boolean {
+  return Boolean(
+    credentials.github_token || credentials.notion_api_key || credentials.slack_token,
+  );
+}
+
+export function isGitHubReady(
+  sources: CapabilitiesSources,
+  credentials: SourceCredentials = loadSourceCredentials(),
+): boolean {
+  if (credentials.github_token?.trim()) return true;
+  return Boolean(sources.github?.configured);
+}
+
+export async function ensureGitHubReady(
+  apiBase: string,
+  credentials: SourceCredentials = loadSourceCredentials(),
+): Promise<{ ok: true; sources: CapabilitiesSources } | { ok: false; message: string }> {
+  if (credentials.github_token?.trim()) {
+    return { ok: true, sources: {} };
+  }
+  try {
+    const response = await fetchCapabilities(apiBase, credentials);
+    if (!response.ok) {
+      return { ok: false, message: `Could not verify GitHub access (${response.status}).` };
+    }
+    const payload = await response.json();
+    const sources = (payload?.capabilities?.sources ?? {}) as CapabilitiesSources;
+    if (sources.github?.configured) {
+      return { ok: true, sources };
+    }
+    return { ok: false, message: GITHUB_REQUIRED_MESSAGE };
+  } catch {
+    return { ok: false, message: "Could not reach the API to verify GitHub credentials." };
+  }
+}
+
+export async function fetchCapabilities(
+  apiBase: string,
+  credentials: SourceCredentials,
+): Promise<Response> {
+  if (hasAnyCredentials(credentials)) {
+    return fetch(`${apiBase}/agent/capabilities`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(credentialsPayload(credentials)),
+    });
+  }
+  return fetch(`${apiBase}/agent/capabilities`);
+}

@@ -307,20 +307,25 @@ export function pickRandom<T>(items: readonly T[]): T {
 
 export function detectMode(question: string): InvestigationMode {
   const q = question.toLowerCase();
-  if (q.includes("secret") || q.includes("credential") || q.includes("token") || q.includes("leak")) {
+  if (q.includes("secret") || q.includes("credential") || q.includes("leak")) {
     return "secrets";
   }
-  if (q.includes("policy") || q.includes("compliance") || q.includes("violation")) {
-    return "policy";
-  }
+  const hasDep =
+    q.includes("dependency") ||
+    q.includes("dependencies") ||
+    q.includes("package") ||
+    q.includes("cve") ||
+    q.includes("vulnerability") ||
+    q.includes("vulnerable") ||
+    q.includes("upgrade") ||
+    q.includes("supply chain");
+  const hasPolicy =
+    q.includes("policy") || q.includes("compliance") || q.includes("violation");
+  // Compound questions (e.g. dependency upgrades + policy review) → dependency mode.
+  if (hasDep) return "dep";
+  if (hasPolicy) return "policy";
   if (q.includes("release") || q.includes("deploy") || q.includes("production")) {
     return "release";
-  }
-  if (
-    q.includes("dependency") || q.includes("package") || q.includes("cve") ||
-    q.includes("vulnerability") || q.includes("upgrade")
-  ) {
-    return "dep";
   }
   return "general";
 }

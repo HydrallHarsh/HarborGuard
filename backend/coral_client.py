@@ -3,10 +3,17 @@ import logging
 import os
 import subprocess
 import time
+import contextvars
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
 logger = logging.getLogger("harborguard.coral")
+
+_coral_credential_overrides: contextvars.ContextVar[dict[str, str] | None] = contextvars.ContextVar(
+    "coral_credential_overrides",
+    default=None,
+)
 
 
 def load_dotenv() -> None:
@@ -36,8 +43,79 @@ def load_dotenv() -> None:
                 os.environ[key] = value
 
 
+def harborguard_root() -> Path:
+    return Path(__file__).resolve().parent.parent
+
+
+def resolve_coral_bin() -> str:
+    """
+    Prefer CORAL_BIN from env; resolve relative paths from harborguard root.
+    Otherwise use coral-download/coral.exe when present, else PATH `coral`.
+    """
+    root = harborguard_root()
+    override = os.getenv("CORAL_BIN", "").strip()
+    if override:
+        candidate = Path(os.path.expandvars(override))
+        if not candidate.is_absolute():
+            candidate = (root / candidate).resolve()
+        if candidate.exists():
+            return str(candidate)
+        if "/" not in override and "\\" not in override:
+            return override
+        return str(candidate)
+
+    for name in ("coral.exe", "coral"):
+        bundled = root / "coral-download" / name
+        if bundled.is_file():
+            return str(bundled.resolve())
+    return "coral"
+
+
+def resolve_coral_config_dir() -> str | None:
+    raw = os.getenv("CORAL_CONFIG_DIR", "").strip()
+    if not raw:
+        return None
+    return os.path.expandvars(raw)
+
+
+def get_credential(env_key: str) -> str:
+    overrides = _coral_credential_overrides.get()
+    if overrides and overrides.get(env_key):
+        return overrides[env_key]
+    return os.getenv(env_key, "").strip()
+
+
+@contextmanager
+def coral_credentials_context(
+    github_token: str | None = None,
+    notion_api_key: str | None = None,
+    slack_token: str | None = None,
+):
+    """Per-request Coral/GitHub credentials (UI-provided or server .env fallback)."""
+    overrides: dict[str, str] = {}
+    if github_token and github_token.strip():
+        overrides["GITHUB_TOKEN"] = github_token.strip()
+    if notion_api_key and notion_api_key.strip():
+        overrides["NOTION_API_KEY"] = notion_api_key.strip()
+    if slack_token and slack_token.strip():
+        overrides["SLACK_TOKEN"] = slack_token.strip()
+
+    if not overrides:
+        yield
+        return
+
+    reset = _coral_credential_overrides.set(overrides)
+    try:
+        yield
+    finally:
+        _coral_credential_overrides.reset(reset)
+
+
 def coral_env(config_dir: str | None) -> dict[str, str]:
     env = os.environ.copy()
+    overrides = _coral_credential_overrides.get()
+    if overrides:
+        env.update(overrides)
     if config_dir:
         env["CORAL_CONFIG_DIR"] = config_dir
     else:
@@ -65,9 +143,10 @@ class CoralClientError(RuntimeError):
 class CoralClient:
     def __init__(self) -> None:
         load_dotenv()
-        self.coral_bin = os.getenv("CORAL_BIN", "coral")
-        self.config_dir = os.getenv("CORAL_CONFIG_DIR") or None
+        self.coral_bin = resolve_coral_bin()
+        self.config_dir = resolve_coral_config_dir()
         self.timeout_seconds = float(os.getenv("CORAL_QUERY_TIMEOUT_SECONDS", "20"))
+        logger.info("coral.client.init bin=%s config_dir=%s", self.coral_bin, self.config_dir)
 
     def query(self, sql: str, timeout_seconds: float | None = None) -> CoralResult:
         command = [self.coral_bin, "sql", "--format", "json", sql]

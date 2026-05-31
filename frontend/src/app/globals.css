@@ -329,9 +329,13 @@ h1, h2, h3, h4 {
 
 .caseFile span {
   font-size: 0.78rem;
-  color: var(--text-3);
-  line-height: 1.4;
+  color: var(--text-2);
+  line-height: 1.45;
   font-weight: 400;
+}
+
+.caseFile.active span {
+  color: #d4cfc0;
 }
 
 .caseFile:hover {
@@ -411,44 +415,230 @@ h1, h2, h3, h4 {
   cursor: not-allowed;
 }
 
+.qFormActions {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 8px;
+  margin-top: 20px;
+  animation: fadeUp 0.6s var(--ease) 0.34s backwards;
+}
+
+.qFormHint {
+  font-size: 0.82rem;
+  color: var(--amber);
+  text-align: right;
+}
+
+/* Credentials panel */
+.credPanel {
+  width: 100%;
+  margin-top: 18px;
+  padding: 20px 22px;
+  border-radius: var(--radius);
+  background: var(--surface-solid);
+  border: 1px solid var(--border-h);
+  text-align: left;
+  animation: fadeUp 0.6s var(--ease) 0.28s backwards;
+}
+
+.credPanelNeedsAuth {
+  border-color: rgba(251, 191, 36, 0.28);
+  box-shadow: 0 0 0 1px rgba(251, 191, 36, 0.06);
+}
+
+.credPanelReady {
+  border-color: rgba(52, 211, 153, 0.22);
+}
+
+.credPanelHead {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 16px;
+}
+
+.credPanelTitle {
+  font-family: var(--font-body);
+  font-size: 1rem;
+  font-weight: 600;
+  color: var(--text);
+  letter-spacing: -0.01em;
+}
+
+.credPanelSub {
+  margin-top: 4px;
+  font-size: 0.84rem;
+  color: var(--text-2);
+  line-height: 1.45;
+}
+
+.credPanelBadge {
+  flex-shrink: 0;
+  padding: 4px 10px;
+  border-radius: 999px;
+  font-family: var(--font-mono);
+  font-size: 0.62rem;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--text-2);
+  background: var(--raised-solid);
+  border: 1px solid var(--border-h);
+}
+
+.credAlert {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  margin-bottom: 16px;
+  padding: 12px 14px;
+  border-radius: var(--radius-sm);
+  background: rgba(251, 191, 36, 0.1);
+  border: 1px solid rgba(251, 191, 36, 0.28);
+}
+
+.credAlertIcon {
+  flex-shrink: 0;
+  width: 20px;
+  height: 20px;
+  display: grid;
+  place-items: center;
+  border-radius: 50%;
+  font-size: 0.72rem;
+  font-weight: 700;
+  color: #1a1508;
+  background: var(--amber);
+}
+
+.credAlert p {
+  font-size: 0.84rem;
+  line-height: 1.5;
+  color: #fde68a;
+}
+
+.credGrid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 14px;
+}
+
+.credFootnote {
+  margin-top: 14px;
+  font-size: 0.8rem;
+  line-height: 1.55;
+  color: var(--text-2);
+}
+
+.credFootnote code {
+  font-family: var(--font-mono);
+  font-size: 0.76rem;
+  color: var(--text);
+  background: var(--raised-solid);
+  padding: 2px 6px;
+  border-radius: 4px;
+  border: 1px solid var(--border-h);
+}
+
+/* Repository panel */
+.repoPanel {
+  width: 100%;
+  margin-top: 14px;
+  padding: 20px 22px;
+  border-radius: var(--radius);
+  background: var(--surface-solid);
+  border: 1px solid var(--border-h);
+  text-align: left;
+  animation: fadeUp 0.6s var(--ease) 0.3s backwards;
+}
+
+.repoPreview {
+  flex-shrink: 0;
+  font-family: var(--font-mono);
+  font-size: 0.78rem;
+  color: var(--text);
+  padding: 6px 12px;
+  border-radius: var(--radius-sm);
+  background: var(--raised-solid);
+  border: 1px solid var(--border-h);
+}
+
+.advancedGrid {
+  margin-top: 12px;
+}
+
+.advancedDrawer {
+  margin-top: 14px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border);
+}
+
 /* Config Drawer */
 .cfgDrawer {
   width: 100%;
-  margin-top: 16px;
-  animation: fadeUp 0.6s var(--ease) 0.3s backwards;
+  margin-top: 14px;
+  animation: fadeUp 0.6s var(--ease) 0.32s backwards;
+}
+
+.cfgDrawerBody {
+  margin-top: 14px;
+  padding: 16px 18px;
+  border-radius: var(--radius);
+  background: rgba(22, 21, 28, 0.55);
+  border: 1px solid var(--border);
+  text-align: left;
 }
 
 .cfgSummary {
   display: inline-flex;
   align-items: center;
-  justify-content: center;
   gap: 8px;
   font-family: var(--font-body);
   font-weight: 500;
-  font-size: 0.85rem;
-  color: var(--text);
+  font-size: 0.84rem;
+  color: var(--text-2);
   cursor: pointer;
-  padding: 10px 20px;
-  border-radius: var(--radius-sm);
-  background: var(--raised);
-  border: 1px solid var(--border);
-  transition: all 0.2s var(--ease);
+  padding: 8px 4px;
+  transition: color 0.2s var(--ease);
   user-select: none;
   list-style: none;
-  margin: 0 auto;
+}
+
+.cfgSummaryLeft {
+  display: flex;
+  width: 100%;
+  justify-content: flex-start;
+}
+
+.cfgSummary::before {
+  content: "▸";
+  font-size: 0.72rem;
+  color: var(--text-3);
+  transition: transform 0.2s var(--ease);
+}
+
+.cfgDrawer[open] > .cfgSummary::before,
+.advancedDrawer[open] > .cfgSummary::before {
+  transform: rotate(90deg);
 }
 
 .cfgSummary::-webkit-details-marker { display: none; }
-.cfgSummary:hover { 
-  background: var(--surface);
-  border-color: var(--border-h);
-  color: var(--accent);
+
+.cfgSummary:hover {
+  color: var(--text);
 }
 
 .cfgSummary.small {
-  font-size: 0.76rem;
-  padding: 8px 14px;
-  margin-top: 14px;
+  font-size: 0.78rem;
+  margin-top: 12px;
+}
+
+.cfgHint {
+  margin: 8px 0 12px;
+  font-size: 0.82rem;
+  color: var(--text-2);
+  line-height: 1.55;
+  max-width: 100%;
 }
 
 .advancedDrawer {
@@ -458,41 +648,71 @@ h1, h2, h3, h4 {
 .cfgGrid {
   display: grid;
   grid-template-columns: repeat(3, 1fr);
-  gap: 10px;
-  margin-top: 14px;
+  gap: 14px;
   text-align: left;
 }
 
 .field {
   display: flex;
   flex-direction: column;
-  gap: 5px;
+  gap: 6px;
 }
 
-.field span {
-  font-family: var(--font-mono);
+.fieldLabel {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-family: var(--font-body);
+  font-size: 0.82rem;
+  font-weight: 500;
+  color: var(--text);
+  letter-spacing: 0;
+  text-transform: none;
+}
+
+.fieldTag {
+  font-style: normal;
   font-size: 0.65rem;
+  font-weight: 600;
+  letter-spacing: 0.03em;
   text-transform: uppercase;
-  letter-spacing: 0.06em;
-  color: var(--text-3);
+  padding: 2px 7px;
+  border-radius: 999px;
+  color: var(--text-2);
+  background: var(--raised-solid);
+  border: 1px solid var(--border-h);
+}
+
+.fieldTagReq {
+  color: #fde68a;
+  background: rgba(251, 191, 36, 0.12);
+  border-color: rgba(251, 191, 36, 0.25);
 }
 
 .field input {
   width: 100%;
-  padding: 10px 12px;
-  border: 1px solid var(--border);
+  padding: 11px 13px;
+  border: 1px solid var(--border-h);
   border-radius: var(--radius-sm);
-  background: var(--raised);
-  font-size: 0.85rem;
+  background: var(--raised-solid);
+  color: var(--text);
+  font-size: 0.88rem;
   outline: none;
   transition: all 0.2s var(--ease);
 }
 
-.field input::placeholder { color: var(--text-3); }
+.field input::placeholder {
+  color: #8b849e;
+  opacity: 1;
+}
 
 .field input:focus {
   border-color: var(--border-focus);
   box-shadow: 0 0 0 2px var(--accent-s);
+}
+
+.fieldRequired .fieldLabel {
+  color: var(--text);
 }
 
 /* Source Pills */
@@ -524,6 +744,11 @@ h1, h2, h3, h4 {
   color: var(--green);
 }
 
+.srcPill.partial {
+  border-color: rgba(251, 191, 36, 0.25);
+  color: var(--amber);
+}
+
 .srcPill.off {
   opacity: 0.5;
 }
@@ -542,7 +767,7 @@ h1, h2, h3, h4 {
 
 .bError {
   margin-top: 14px;
-  color: var(--red);
+  color: #fecaca;
   font-size: 0.82rem;
   padding: 10px 16px;
   border-radius: var(--radius-sm);
@@ -1300,8 +1525,58 @@ h1, h2, h3, h4 {
   color: var(--text-2);
 }
 
-.reviewTitle {
+.reviewTitle,
+.coverageTitle {
   margin-top: 16px;
+  color: var(--text-2);
+}
+
+.coverageList {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+.coverageItem {
+  padding: 10px 12px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border-h);
+  background: var(--raised-solid);
+}
+
+.coverageSource {
+  display: block;
+  font-family: var(--font-mono);
+  font-size: 0.62rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text-2);
+  margin-bottom: 4px;
+}
+
+.coverageDetail {
+  display: block;
+  font-size: 0.82rem;
+  line-height: 1.45;
+  color: var(--text);
+}
+
+.coverageItem.status-clear {
+  border-color: rgba(52, 211, 153, 0.2);
+}
+
+.coverageItem.status-matched,
+.coverageItem.status-reviewed {
+  border-color: rgba(251, 191, 36, 0.25);
+}
+
+.coverageItem.status-failed,
+.coverageItem.status-skipped {
+  border-color: rgba(248, 113, 113, 0.25);
+}
+
+.reviewTitle {
   color: var(--text-3);
 }
 
@@ -2313,7 +2588,11 @@ h1, h2, h3, h4 {
   .briefing { padding: 24px 16px; }
   .bTitle { font-size: 3rem; }
   .caseGrid { grid-template-columns: 1fr; }
-  .cfgGrid { grid-template-columns: 1fr 1fr; }
+  .cfgGrid,
+  .credGrid { grid-template-columns: 1fr; }
+  .credPanelHead { flex-direction: column; align-items: flex-start; }
+  .qFormActions { align-items: stretch; }
+  .qBtn { width: 100%; }
   .topBar { flex-direction: column; align-items: stretch; }
   .tbBrand { border-right: none; border-bottom: 1px solid var(--border); }
   .tbRight { border-left: none; border-top: 1px solid var(--border); justify-content: space-between; }

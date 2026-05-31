@@ -4,13 +4,22 @@ import { FormEvent, useCallback, useEffect, useState } from "react";
 import { motion, AnimatePresence } from "motion/react";
 import { useRouter } from "next/navigation";
 import {
+  fetchCapabilities,
+  isGitHubReady,
+  loadSourceCredentials,
+  saveSourceCredentials,
+  type SourceCredentials,
+} from "./utils/credentials";
+import {
   DEMO_REPO,
   KONAMI_CODE,
   KONAMI_MESSAGE,
+  MODE_META,
   TAGLINE_ROTATION,
   TITLE_EASTER_EGG_MESSAGES,
   detectMode,
   pickRandom,
+  type InvestigationMode,
 } from "./utils/flavor";
 
 const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://127.0.0.1:8000";
@@ -31,7 +40,7 @@ type InvestigationForm = {
 const initialForm: InvestigationForm = {
   question: "Did dependency upgrades introduce risk and require policy review?",
   owner: "withcoral", repo: "coral", org: "withcoral", slack_channel: "",
-  policy_query: "dependency security review secrets access control",
+  policy_query: "dependency security policy",
   package_system: "", package_ecosystem: "", package_name: "", package_version: "",
 };
 
@@ -51,20 +60,32 @@ export default function Home() {
   const [titleClicks, setTitleClicks] = useState(0);
   const [easterEgg, setEasterEgg] = useState<string | null>(null);
   const [konamiIdx, setKonamiIdx] = useState(0);
+  const [credentials, setCredentials] = useState<SourceCredentials>({});
+  const [selectedCaseId, setSelectedCaseId] = useState<InvestigationMode | null>("dep");
 
-  const activeMode = detectMode(form.question);
+  const activeMode: InvestigationMode =
+    selectedCaseId &&
+    CASE_PRESETS.some(p => p.id === selectedCaseId && p.question === form.question)
+      ? selectedCaseId
+      : detectMode(form.question);
+  const modeLabel = activeMode === "general" ? "Custom" : MODE_META[activeMode].label;
 
-  async function refreshCapabilities() {
+  async function refreshCapabilities(creds: SourceCredentials = credentials) {
     try {
-      const r = await fetch(`${API_BASE}/agent/capabilities`);
+      const r = await fetchCapabilities(API_BASE, creds);
       if (!r.ok) throw new Error(`${r.status}`);
       setCapabilities(await r.json());
+      setError(null);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Could not load capabilities");
     }
   }
 
-  useEffect(() => { void refreshCapabilities(); }, []);
+  useEffect(() => {
+    const saved = loadSourceCredentials();
+    setCredentials(saved);
+    void refreshCapabilities(saved);
+  }, []);
 
   useEffect(() => {
     const id = setInterval(() => setTagline(pickRandom(TAGLINE_ROTATION)), 6000);
@@ -100,20 +121,40 @@ export default function Home() {
   }
 
   function loadDemoRepo() {
+    const question = "Did dependency upgrades introduce risk and require policy review?";
+    setSelectedCaseId("dep");
     setForm({
       ...form,
       owner: DEMO_REPO.owner,
       repo: DEMO_REPO.repo,
       org: DEMO_REPO.org,
-      question: "Did dependency upgrades introduce risk and require policy review?",
+      question,
     });
   }
 
+  function selectCasePreset(preset: (typeof CASE_PRESETS)[number]) {
+    setSelectedCaseId(preset.id as InvestigationMode);
+    setForm({ ...form, question: preset.question });
+  }
+
+  function handleQuestionChange(question: string) {
+    const match = CASE_PRESETS.find(p => p.question === question);
+    setSelectedCaseId(match ? (match.id as InvestigationMode) : null);
+    setForm({ ...form, question });
+  }
+
   const sources = capabilities?.capabilities?.sources ?? {};
+  const githubReady = isGitHubReady(sources, credentials);
 
   function startInvestigation(e: FormEvent) {
     e.preventDefault();
     if (!form.question.trim()) return;
+    if (!isGitHubReady(sources, credentials)) {
+      setError("Add a GitHub token above, or use a deployment with GITHUB_TOKEN already configured.");
+      return;
+    }
+
+    saveSourceCredentials(credentials);
 
     const params = new URLSearchParams();
     Object.entries(form).forEach(([key, val]) => {
@@ -121,6 +162,12 @@ export default function Home() {
     });
 
     router.push(`/dashboard?${params.toString()}`);
+  }
+
+  function updateCredentials(next: SourceCredentials) {
+    setCredentials(next);
+    saveSourceCredentials(next);
+    void refreshCapabilities(next);
   }
 
   return (
@@ -158,8 +205,8 @@ export default function Home() {
         <div className="caseGrid">
           {CASE_PRESETS.map((p, i) => (
             <motion.button key={p.id}
-              className={`caseFile ${form.question === p.question ? "active" : ""}`}
-              onClick={() => setForm({ ...form, question: p.question })}
+              className={`caseFile ${selectedCaseId === p.id ? "active" : ""}`}
+              onClick={() => selectCasePreset(p)}
               initial={{ opacity: 0, y: 12 }}
               animate={{ opacity: 1, y: 0 }}
               transition={{ delay: 0.25 + i * 0.06, type: "spring", stiffness: 200, damping: 20 }}
@@ -182,39 +229,84 @@ export default function Home() {
         <form className="qForm" onSubmit={startInvestigation}>
           <div className="qArea">
             <div className="qAreaHead">
-              <span className={`modeChip mode-${activeMode}`}>{activeMode === "general" ? "Custom" : activeMode}</span>
-              <span className="qAreaHint">{form.owner}/{form.repo}</span>
+              <span className={`modeChip mode-${activeMode}`}>{modeLabel}</span>
             </div>
             <textarea className="qInput" value={form.question}
-              onChange={e => setForm({ ...form, question: e.target.value })}
+              onChange={e => handleQuestionChange(e.target.value)}
               placeholder="Ask a security question..." rows={3} />
-            <button type="submit" className="qBtn" disabled={!form.question.trim()}>
-              Begin Investigation →
-            </button>
           </div>
 
-          <details className="cfgDrawer">
-            <summary className="cfgSummary">Repository scan inputs</summary>
+          <section className={`credPanel ${githubReady ? "credPanelReady" : "credPanelNeedsAuth"}`}>
+            <header className="credPanelHead">
+              <div>
+                <h3 className="credPanelTitle">Source credentials</h3>
+                <p className="credPanelSub">Connect your tools — saved in this browser, never in the URL.</p>
+              </div>
+              <span className="credPanelBadge">Saved locally</span>
+            </header>
+
+            {!githubReady && (
+              <div className="credAlert" role="status">
+                <span className="credAlertIcon" aria-hidden>!</span>
+                <p>Add a GitHub token to scan repositories. Notion and Slack are optional.</p>
+              </div>
+            )}
+
+            <div className="credGrid">
+              <TFSecret label="GitHub token" required value={credentials.github_token ?? ""}
+                set={v => updateCredentials({ ...credentials, github_token: v })}
+                ph="ghp_… or fine-grained PAT" />
+              <TFSecret label="Notion API key" optional value={credentials.notion_api_key ?? ""}
+                set={v => updateCredentials({ ...credentials, notion_api_key: v })}
+                ph="ntn_… integration secret" />
+              <TFSecret label="Slack token" optional value={credentials.slack_token ?? ""}
+                set={v => updateCredentials({ ...credentials, slack_token: v })}
+                ph="xoxp-… or xoxb-…" />
+            </div>
+
+            <p className="credFootnote">
+              Server deployments can set <code>GITHUB_TOKEN</code> in the environment — if the GitHub pill below is green, you can skip pasting your own.
+            </p>
+          </section>
+
+          <section className="repoPanel">
+            <header className="credPanelHead">
+              <div>
+                <h3 className="credPanelTitle">Repository scan inputs</h3>
+                <p className="credPanelSub">Target repo for this investigation.</p>
+              </div>
+              <span className="repoPreview">{form.owner}/{form.repo}</span>
+            </header>
             <div className="cfgGrid">
-              <TF label="Owner" value={form.owner} set={v => setForm({ ...form, owner: v })} />
-              <TF label="Repository" value={form.repo} set={v => setForm({ ...form, repo: v })} />
-              <TF label="Slack channel" value={form.slack_channel} set={v => setForm({ ...form, slack_channel: v })} ph="optional" />
+              <TF label="Owner" value={form.owner} set={v => setForm({ ...form, owner: v })} ph="GitHub org or user" />
+              <TF label="Repository" value={form.repo} set={v => setForm({ ...form, repo: v })} ph="repo name" />
+              <TF label="Slack channel" value={form.slack_channel} set={v => setForm({ ...form, slack_channel: v })} ph="optional — #channel" />
             </div>
             <details className="advancedDrawer">
-              <summary className="cfgSummary small">Advanced package override</summary>
-              <div className="cfgGrid">
+              <summary className="cfgSummary small cfgSummaryLeft">Advanced package override</summary>
+              <div className="cfgGrid advancedGrid">
                 <TF label="Package" value={form.package_name} set={v => setForm({ ...form, package_name: v })} ph="auto-detect" />
                 <TF label="Version" value={form.package_version} set={v => setForm({ ...form, package_version: v })} ph="auto-detect" />
                 <TF label="System" value={form.package_system} set={v => setForm({ ...form, package_system: v })} ph="NPM, PYPI, GO" />
                 <TF label="Ecosystem" value={form.package_ecosystem} set={v => setForm({ ...form, package_ecosystem: v })} ph="npm, PyPI, Go" />
               </div>
             </details>
-          </details>
+          </section>
+
+          <div className="qFormActions">
+            <button type="submit" className="qBtn" disabled={!form.question.trim() || !githubReady}>
+              Begin Investigation →
+            </button>
+            {!githubReady && form.question.trim() && (
+              <p className="qFormHint">Connect GitHub above to continue.</p>
+            )}
+          </div>
         </form>
 
         <div className="srcPills">
           {Object.entries(sources).map(([n, s]) => (
-            <div key={n} className={`srcPill ${s.available ? "on" : "off"}`}>
+            <div key={n} className={`srcPill ${s.configured ? "on" : s.available ? "partial" : "off"}`}
+              title={s.configured ? "Connected" : s.available ? "Available — add token above" : "Unavailable"}>
               <span className="srcDot" />{n.replace(/_/g, " ")}
             </div>
           ))}
@@ -232,8 +324,35 @@ export default function Home() {
 function TF({ label, value, set, ph }: { label: string; value: string; set: (v: string) => void; ph?: string }) {
   return (
     <label className="field">
-      <span>{label}</span>
+      <span className="fieldLabel">{label}</span>
       <input value={value} placeholder={ph} onChange={e => set(e.target.value)} />
+    </label>
+  );
+}
+
+function TFSecret({
+  label,
+  value,
+  set,
+  ph,
+  required,
+  optional,
+}: {
+  label: string;
+  value: string;
+  set: (v: string) => void;
+  ph?: string;
+  required?: boolean;
+  optional?: boolean;
+}) {
+  return (
+    <label className={`field ${required ? "fieldRequired" : ""}`}>
+      <span className="fieldLabel">
+        {label}
+        {required && <em className="fieldTag fieldTagReq">Required</em>}
+        {optional && <em className="fieldTag">Optional</em>}
+      </span>
+      <input type="password" autoComplete="off" value={value} placeholder={ph} onChange={e => set(e.target.value)} />
     </label>
   );
 }

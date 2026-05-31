@@ -16,5 +16,7 @@ wheels/
 .venv/
 backend/.venv/
 .coral-config/
-coral-download/
+coral-download/*
+!coral-download/README.md
+coral-x86_64-pc-windows-msvc.zip
 skills-lock.json

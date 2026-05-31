@@ -7,6 +7,13 @@ import { EvidenceGraph } from "../components/EvidenceGraph";
 import { LoadingQuipDisplay } from "../components/LoadingQuipDisplay";
 import { SchemaPanel } from "../components/SchemaPanel";
 import {
+  credentialsPayload,
+  ensureGitHubReady,
+  fetchCapabilities,
+  loadSourceCredentials,
+  type SourceCredentials,
+} from "../utils/credentials";
+import {
   MODE_META,
   detectMode,
   getCompletionQuip,
@@ -45,10 +52,13 @@ type GraphNode = { id: string; type: string; label: string; severity?: string; s
 type GraphEdge = { from: string; to: string; type: string };
 type EvidenceGraphData = { nodes?: GraphNode[]; edges?: GraphEdge[] };
 type Verdict = { verdict: "escalate" | "monitor" | "close"; confidence: number; headline: string; because: string[]; next_action: string | null };
+type ScanCoverage = { source: string; status: string; detail: string };
 type InvestigationResponse = {
   verdict?: Verdict;
-  answer?: string; risk_level?: string; score?: number; findings?: Finding[];
+  answer?: string; risk_level?: string; score?: number; investigation_mode?: string;
+  findings?: Finding[];
   review_signals?: Finding[];
+  scan_coverage?: ScanCoverage[];
   planner?: Planner; reasoning_trace?: string[]; evidence_graph?: EvidenceGraphData;
   steps?: Step[]; capability_summary?: Record<string, unknown>;
   target_package?: {
@@ -73,7 +83,7 @@ type InvestigationForm = {
 const initialForm: InvestigationForm = {
   question: "Did dependency upgrades introduce risk and require policy review?",
   owner: "withcoral", repo: "coral", org: "withcoral", slack_channel: "",
-  policy_query: "dependency security review secrets access control",
+  policy_query: "dependency security policy",
   package_system: "", package_ecosystem: "", package_name: "", package_version: "",
 };
 
@@ -149,9 +159,9 @@ function DashboardContent() {
   const investigationMode = detectMode(question);
   const modeMeta = MODE_META[investigationMode];
 
-  async function refreshCapabilities() {
+  async function refreshCapabilities(creds?: SourceCredentials) {
     try {
-      const r = await fetch(`${API_BASE}/agent/capabilities`);
+      const r = await fetchCapabilities(API_BASE, creds ?? loadSourceCredentials());
       if (!r.ok) throw new Error(`${r.status}`);
       setCapabilities(await r.json());
     } catch (err) {
@@ -221,12 +231,20 @@ function DashboardContent() {
     setResult(null);
     setLiveSteps(["Initializing investigation..."]);
     setLiveQueries([]);
+    const creds = loadSourceCredentials();
+    const githubCheck = await ensureGitHubReady(API_BASE, creds);
+    if (!githubCheck.ok) {
+      setError(githubCheck.message);
+      setLoading(false);
+      return;
+    }
     const payload = {
       question, owner, repo, org: org || owner, slack_channel: slack_channel || null,
       policy_query, package_system: package_system || null,
       package_ecosystem: package_ecosystem || null,
       package_name: package_name || null, package_version: package_version || null,
       days: 7,
+      ...credentialsPayload(creds),
     };
     try {
       const r = await fetch(`${API_BASE}/agent/investigate/stream`, {
@@ -360,6 +378,7 @@ function DashboardContent() {
   if (result) {
     const findings = result.findings ?? [];
     const reviewSignals = result.review_signals ?? [];
+    const scanCoverage = result.scan_coverage ?? [];
     const trace = result.reasoning_trace ?? [];
     const steps = result.steps ?? [];
 
@@ -462,8 +481,21 @@ function DashboardContent() {
               ))}
               {findings.length === 0 && (
                 <p className="feedEmpty">
-                  No findings detected. {completionQuip ?? "The harbor is calm."}
+                  No actionable findings. {completionQuip ?? "The harbor is calm."}
                 </p>
+              )}
+              {scanCoverage.length > 0 && (
+                <>
+                  <h3 className="secTitle coverageTitle">Scan coverage <span className="badge">{scanCoverage.length}</span></h3>
+                  <div className="coverageList">
+                    {scanCoverage.map((item, i) => (
+                      <div key={`${item.source}-${i}`} className={`coverageItem status-${item.status}`}>
+                        <span className="coverageSource">{item.source.replace(".", " · ")}</span>
+                        <span className="coverageDetail">{item.detail}</span>
+                      </div>
+                    ))}
+                  </div>
+                </>
               )}
               {reviewSignals.length > 0 && (
                 <>
@@ -639,7 +671,9 @@ function FindingCard({ finding: f, delay }: { finding: Finding; delay: number })
           <span className="fType">{f.type.replace(/_/g, " ")}</span>
           <h4 className="fTitle">{f.title}</h4>
         </div>
-        <div className={`fScore ${f.severity}`}>{f.score}</div>
+        <div className={`fScore ${f.severity}`}>
+          {f.score > 0 ? f.score : "—"}
+        </div>
       </div>
       <p className="fRec">{f.recommendation}</p>
 

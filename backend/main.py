@@ -19,7 +19,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from coral_mcp_client import CoralMCPClient, CoralMCPError, mcp_discovery_enabled
-from coral_client import CoralClient, CoralClientError, load_dotenv
+from coral_client import CoralClient, CoralClientError, coral_credentials_context, get_credential, load_dotenv
 from llm_orchestrator import (
     LLMPlannerError,
     extract_package_candidates_with_openrouter,
@@ -51,12 +51,24 @@ app = FastAPI(
     description="Security and compliance investigation agent powered by Coral.",
     version="0.1.0",
 )
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=[
+def cors_allow_origins() -> list[str]:
+    origins = [
         "http://localhost:3000",
         "http://127.0.0.1:3000",
-    ],
+    ]
+    extra = os.getenv("HARBORGUARD_CORS_ORIGINS", "").strip()
+    if extra == "*":
+        return ["*"]
+    for item in extra.split(","):
+        origin = item.strip()
+        if origin and origin not in origins:
+            origins.append(origin)
+    return origins
+
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=cors_allow_origins(),
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -143,13 +155,21 @@ class PackageInvestigationReq(BaseModel):
     version: str
 
 
-class AgentInvestigationReq(BaseModel):
+class SourceCredentials(BaseModel):
+    """Optional per-request tokens; server .env values are used when omitted."""
+
+    github_token: str | None = None
+    notion_api_key: str | None = None
+    slack_token: str | None = None
+
+
+class AgentInvestigationReq(SourceCredentials):
     question: str
     owner: str
     repo: str
     org: str | None = None
     slack_channel: str | None = None
-    policy_query: str | None = "dependency security review secrets access control"
+    policy_query: str | None = "dependency security policy"
     package_system: str | None = None
     package_ecosystem: str | None = None
     package_name: str | None = None
@@ -242,6 +262,159 @@ INVESTIGATION_TOOLS = {
 
 def sql_string(value: str) -> str:
     return value.replace("'", "''")
+
+
+def _notion_raw_object(row: dict[str, object]) -> dict[str, object]:
+    raw = row.get("raw")
+    if isinstance(raw, dict):
+        return raw
+    if isinstance(raw, str) and raw.strip():
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, dict):
+                return parsed
+        except json.JSONDecodeError:
+            pass
+    return {}
+
+
+def notion_row_search_text(row: dict[str, object]) -> str:
+    """Text used for policy keyword matching — includes title from Notion `raw`."""
+    parts = [str(row.get("url") or ""), str(row.get("raw") or "")]
+    raw_obj = _notion_raw_object(row)
+    props = raw_obj.get("properties")
+    if isinstance(props, dict):
+        for prop in props.values():
+            if not isinstance(prop, dict):
+                continue
+            if prop.get("type") == "title":
+                for item in prop.get("title") or []:
+                    if isinstance(item, dict):
+                        parts.append(str(item.get("plain_text") or ""))
+    return " ".join(parts).lower()
+
+
+def notion_title_from_url(url: object) -> str | None:
+    if not url:
+        return None
+    slug = str(url).rstrip("/").split("/")[-1]
+    match = re.match(r"^(.+)-([0-9a-f]{32})$", slug, re.I)
+    if match:
+        slug = match.group(1)
+    title = slug.replace("-", " ").strip()
+    return title or None
+
+
+def notion_row_display_title(row: dict[str, object]) -> str:
+    raw_obj = _notion_raw_object(row)
+    props = raw_obj.get("properties")
+    if isinstance(props, dict):
+        for prop in props.values():
+            if isinstance(prop, dict) and prop.get("type") == "title":
+                chunks = [
+                    str(item.get("plain_text") or "")
+                    for item in (prop.get("title") or [])
+                    if isinstance(item, dict)
+                ]
+                title = " ".join(chunk for chunk in chunks if chunk).strip()
+                if title:
+                    return title
+    from_url = notion_title_from_url(row.get("url"))
+    if from_url:
+        return from_url
+    return str(row.get("id") or "policy document")
+
+
+def policy_search_queries(policy_query: str | None, question: str) -> list[str]:
+    """Build Notion title-search strings from the request — no fixed page names."""
+    queries: list[str] = []
+    seen: set[str] = set()
+
+    def add(value: str) -> None:
+        text = value.strip()
+        key = text.casefold()
+        if text and key not in seen:
+            seen.add(key)
+            queries.append(text)
+
+    add(policy_query or "")
+
+    # Derive a short query from the investigation question (keywords only).
+    tokens = re.findall(r"[a-z0-9]+", question.lower())
+    focus = (
+        "policy",
+        "security",
+        "compliance",
+        "release",
+        "dependency",
+        "dependencies",
+        "secret",
+        "secrets",
+        "access",
+        "violation",
+        "review",
+        "vulnerability",
+        "credential",
+    )
+    derived = " ".join(word for word in tokens if word in focus)
+    add(derived)
+
+    return queries
+
+
+def fetch_notion_policy_step(policy_query: str | None, question: str = "") -> dict[str, object]:
+    """
+    Notion /v1/search matches shared page titles, not full body text.
+    Uses policy_query + question-derived terms, then lists shared pages if needed.
+    """
+    started_at = time.perf_counter()
+    queries = policy_search_queries(policy_query, question)
+
+    merged: list[dict[str, object]] = []
+    seen_ids: set[str] = set()
+    sql_log: list[str] = []
+    last_error: str | None = None
+    any_ok = False
+
+    def absorb(step: dict[str, object]) -> None:
+        nonlocal any_ok, last_error
+        if step.get("ok"):
+            any_ok = True
+        else:
+            last_error = str(step.get("error") or last_error)
+            return
+        for row in step.get("rows") or []:
+            if not isinstance(row, dict):
+                continue
+            row_id = str(row.get("id") or "")
+            if row_id and row_id not in seen_ids:
+                seen_ids.add(row_id)
+                merged.append(row)
+
+    for query_text in queries:
+        sql = (
+            "SELECT id, object, url, public_url, raw "
+            f"FROM notion.search WHERE query = '{sql_string(query_text)}' LIMIT 5"
+        )
+        sql_log.append(sql)
+        absorb(query_step("_notion_policy_probe", sql))
+        if len(merged) >= 5:
+            break
+
+    if not merged:
+        sql = "SELECT id, object, url, public_url, raw FROM notion.search LIMIT 20"
+        sql_log.append(sql)
+        absorb(query_step("_notion_policy_probe", sql))
+
+    duration_ms = elapsed_ms(started_at)
+    return {
+        "name": "notion_policy_context",
+        "ok": any_ok,
+        "rows": merged[:5],
+        "sql": "\n\n".join(sql_log),
+        "error": None if any_ok else last_error,
+        "duration_ms": duration_ms,
+    }
 
 
 def deps_dev_advisories_sql(advisory_keys: list[str]) -> str | None:
@@ -649,12 +822,23 @@ def extract_candidates_from_manifest(
 
 def investigation_intent(question: str) -> dict[str, bool]:
     lowered = question.lower()
+    has_dep = any(
+        word in lowered
+        for word in (
+            "dependency",
+            "dependencies",
+            "package",
+            "cve",
+            "vulnerability",
+            "vulnerable",
+            "upgrade",
+            "supply chain",
+        )
+    )
+    has_policy = any(word in lowered for word in ("policy", "compliance", "violation"))
     return {
-        "dependency": any(
-            word in lowered
-            for word in ("dependency", "package", "cve", "vulnerability", "vulnerable", "upgrade")
-        ),
-        "policy": any(word in lowered for word in ("policy", "compliance", "violation")),
+        "dependency": has_dep,
+        "policy": has_policy,
         "secrets": any(
             word in lowered
             for word in ("secret", "token", "credential", "leak", "exposed", "credentials")
@@ -664,6 +848,242 @@ def investigation_intent(question: str) -> dict[str, bool]:
             for word in ("release", "deploy", "production", "safe to deploy")
         ),
     }
+
+
+def primary_investigation_mode(question: str) -> str:
+    """Dominant mode for scoring — mirrors frontend detectMode ordering."""
+    lowered = question.lower()
+    if any(word in lowered for word in ("secret", "credential", "leak")):
+        return "secrets"
+    if any(
+        word in lowered
+        for word in (
+            "dependency",
+            "dependencies",
+            "package",
+            "cve",
+            "vulnerability",
+            "vulnerable",
+            "upgrade",
+            "supply chain",
+        )
+    ):
+        return "dep"
+    if any(word in lowered for word in ("policy", "compliance", "violation")):
+        return "policy"
+    if any(word in lowered for word in ("release", "deploy", "production", "safe to deploy")):
+        return "release"
+    return "general"
+
+
+INFORMATIONAL_FINDING_TYPES = frozenset(
+    {
+        "policy_scan_clear",
+        "secrets_scan_clear",
+        "release_readiness_context",
+    }
+)
+
+MODE_FINDING_TYPES: dict[str, frozenset[str]] = {
+    "dep": frozenset({"vulnerable_dependency", "known_vulnerability"}),
+    "secrets": frozenset(
+        {
+            "possible_secret_exposure",
+            "dev_env_files",
+            "template_env_files",
+            "secrets_scan_incomplete",
+        }
+    ),
+    "policy": frozenset({"policy_context_match"}),
+    "release": frozenset({"release_blocked"}),
+}
+
+CROSS_CUTTING_FINDING_TYPES = frozenset(
+    {
+        "vulnerable_dependency",
+        "known_vulnerability",
+        "possible_secret_exposure",
+        "release_blocked",
+        "policy_context_match",
+    }
+)
+
+
+def is_actionable_finding(finding: dict[str, object]) -> bool:
+    finding_type = str(finding.get("type") or "")
+    if finding_type in INFORMATIONAL_FINDING_TYPES:
+        return False
+    return int(finding.get("score") or 0) > 0 or finding_type in (
+        "secrets_scan_incomplete",
+        "possible_secret_exposure",
+        "release_blocked",
+    )
+
+
+def compute_investigation_risk(
+    question: str,
+    findings: list[dict[str, object]],
+    review_signals: list[dict[str, object]] | None = None,
+) -> tuple[int, str]:
+    """Mode-aware score: primary investigation mode drives the headline risk number."""
+    mode = primary_investigation_mode(question)
+    actionable = [f for f in findings if is_actionable_finding(f)]
+    review_signals = review_signals or []
+
+    mode_types = MODE_FINDING_TYPES.get(mode, frozenset())
+    mode_findings = [f for f in actionable if str(f.get("type") or "") in mode_types]
+    cross_cutting = [
+        f
+        for f in actionable
+        if str(f.get("type") or "") in CROSS_CUTTING_FINDING_TYPES
+        and int(f.get("score") or 0) >= 50
+    ]
+
+    pool = mode_findings if mode_findings else actionable
+    for finding in cross_cutting:
+        if finding not in pool:
+            pool.append(finding)
+
+    scores = [int(f.get("score") or 0) for f in pool]
+    if not scores and review_signals:
+        scores = [int(s.get("score") or 0) for s in review_signals if int(s.get("score") or 0) > 0]
+
+    score = max(scores, default=0)
+    return score, level_from_score(score)
+
+
+def build_scan_coverage(
+    steps: list[dict[str, object]],
+    intent: dict[str, bool],
+) -> list[dict[str, object]]:
+    """Non-actionable scan outcomes — shown as coverage, not scored findings."""
+    by_name = {str(step["name"]): step for step in steps}
+    coverage: list[dict[str, object]] = []
+
+    if intent.get("policy"):
+        step = by_name.get("notion_policy_context") or {}
+        if step.get("skipped"):
+            coverage.append(
+                {
+                    "source": "notion.search",
+                    "status": "skipped",
+                    "detail": str(step.get("reason") or "Notion search was not run"),
+                }
+            )
+        elif not step.get("ok"):
+            coverage.append(
+                {
+                    "source": "notion.search",
+                    "status": "failed",
+                    "detail": str(step.get("error") or "Notion policy search failed"),
+                }
+            )
+        else:
+            raw_rows = first_rows(step, limit=20)
+            matched = [
+                row
+                for row in raw_rows
+                if any(
+                    term in notion_row_search_text(row)
+                    for term in ("security", "policy", "vulnerability", "compliance")
+                )
+            ]
+            if matched:
+                coverage.append(
+                    {
+                        "source": "notion.search",
+                        "status": "matched",
+                        "detail": f"{len(matched)} policy document(s) matched",
+                    }
+                )
+            else:
+                coverage.append(
+                    {
+                        "source": "notion.search",
+                        "status": "clear",
+                        "detail": "No policy documents matched this query",
+                    }
+                )
+
+    if intent.get("secrets"):
+        step = by_name.get("github_secret_file_search") or {}
+        if step.get("skipped"):
+            coverage.append(
+                {
+                    "source": "github.search_code",
+                    "status": "skipped",
+                    "detail": str(step.get("reason") or "Secrets search was not run"),
+                }
+            )
+        elif not step.get("ok"):
+            coverage.append(
+                {
+                    "source": "github.search_code",
+                    "status": "failed",
+                    "detail": str(step.get("error") or "GitHub code search failed"),
+                }
+            )
+        elif step.get("ok"):
+            secret_hits = [
+                row
+                for row in first_rows(step, limit=20)
+                if is_secret_bearing_path(str(row.get("path") or row.get("name") or ""))
+                and classify_env_file_path(str(row.get("path") or row.get("name") or ""))
+                in ("likely_real", "unknown")
+            ]
+            if secret_hits:
+                coverage.append(
+                    {
+                        "source": "github.search_code",
+                        "status": "matched",
+                        "detail": f"{len(secret_hits)} potential credential file(s) matched",
+                    }
+                )
+            else:
+                coverage.append(
+                    {
+                        "source": "github.search_code",
+                        "status": "clear",
+                        "detail": "No high-risk credential files matched repository search patterns",
+                    }
+                )
+
+    if intent.get("release"):
+        pull_rows = first_rows(by_name.get("github_recent_pulls", {}), limit=8)
+        commit_rows = first_rows(by_name.get("github_recent_commits", {}), limit=8)
+        if pull_rows or commit_rows:
+            coverage.append(
+                {
+                    "source": "github.pulls",
+                    "status": "reviewed",
+                    "detail": (
+                        f"Reviewed {len(pull_rows)} recent PR(s) and {len(commit_rows)} commit(s) "
+                        "for release indicators"
+                    ),
+                }
+            )
+
+    slack_step = by_name.get("slack_security_discussion") or {}
+    if slack_step and not slack_step.get("skipped"):
+        rows = first_rows(slack_step, limit=3)
+        if rows:
+            coverage.append(
+                {
+                    "source": "slack.messages",
+                    "status": "matched",
+                    "detail": f"{len(rows)} Slack message(s) captured",
+                }
+            )
+        elif slack_step.get("ok"):
+            coverage.append(
+                {
+                    "source": "slack.messages",
+                    "status": "clear",
+                    "detail": "No Slack security discussion matched",
+                }
+            )
+
+    return coverage
 
 
 def classify_env_file_path(path: str) -> str:
@@ -701,7 +1121,7 @@ def classify_env_file_path(path: str) -> str:
 def fetch_github_default_branch(owner: str, repo: str) -> str | None:
     import urllib.request
 
-    token = os.getenv("GITHUB_TOKEN", "").strip()
+    token = get_credential("GITHUB_TOKEN")
     url = f"https://api.github.com/repos/{owner}/{repo}"
     headers = {"Accept": "application/vnd.github+json", "User-Agent": "HarborGuard"}
     if token:
@@ -1559,6 +1979,25 @@ def json_dumps(value: object) -> str:
         return "[]"
 
 
+def github_source_configured(capabilities: dict[str, object]) -> bool:
+    sources = capabilities.get("sources")
+    if not isinstance(sources, dict):
+        return bool(get_credential("GITHUB_TOKEN"))
+    github = sources.get("github")
+    if isinstance(github, dict) and github.get("configured"):
+        return True
+    return bool(get_credential("GITHUB_TOKEN"))
+
+
+def require_github_for_investigation(capabilities: dict[str, object]) -> None:
+    if github_source_configured(capabilities):
+        return
+    raise RuntimeError(
+        "GitHub is not configured. Coral requires GITHUB_TOKEN to scan repositories. "
+        "Add github_token in the request body or set GITHUB_TOKEN in the server environment."
+    )
+
+
 def discover_capabilities() -> dict[str, object]:
     started_at = time.perf_counter()
     backend = "coral_mcp_with_sql_fallback" if mcp_discovery_enabled() else "coral_sql_metadata"
@@ -2066,64 +2505,33 @@ def build_agent_findings(
                 "recommendation": "Retry the investigation or verify GitHub code search permissions.",
             }
         )
-    elif intent["secrets"] and secret_step and secret_step.get("ok"):
-        findings.append(
-            {
-                "type": "secrets_scan_clear",
-                "title": "Secrets scan found no credential-bearing files in repository search",
-                "severity": "informational",
-                "score": 0,
-                "evidence": [
-                    {
-                        "source": "github.search_code",
-                        "text": "Searched for .env, key, credential, and PEM patterns with no high-risk matches.",
-                        "url": None,
-                    }
-                ],
-                "recommendation": "No immediate secret exposure detected from configured code search.",
-            }
-        )
 
     raw_policy_rows = first_rows(by_name.get("notion_policy_context", {}), limit=5)
     policy_rows = []
     for row in raw_policy_rows:
-        text_to_check = f"{row.get('title', '')} {row.get('url', '')} {row.get('raw', '')}".lower()
+        text_to_check = notion_row_search_text(row)
         if any(term in text_to_check for term in ("security", "policy", "vulnerability", "compliance")):
             policy_rows.append(row)
 
     if policy_rows and intent["policy"]:
+        policy_score = 25 + min(len(policy_rows) * 10, 35)
+        if "violation" in req.question.lower():
+            policy_score = min(45 + len(policy_rows) * 15, 80)
         findings.append(
             {
                 "type": "policy_context_match",
                 "title": f"Internal policy documents match this investigation ({len(policy_rows)} hit(s))",
-                "severity": "medium",
-                "score": 20,
+                "severity": level_from_score(policy_score),
+                "score": policy_score,
                 "evidence": [
                     {
                         "source": "notion.search",
-                        "text": str(row.get("title") or row.get("url") or row.get("id") or "policy document"),
+                        "text": notion_row_display_title(row),
                         "url": row.get("url"),
                     }
                     for row in policy_rows[:5]
                 ],
                 "recommendation": "Cross-check recent changes against the matched policy documents.",
-            }
-        )
-    elif intent["policy"] and by_name.get("notion_policy_context", {}).get("ok"):
-        findings.append(
-            {
-                "type": "policy_scan_clear",
-                "title": "No direct policy document matches found for this investigation query",
-                "severity": "informational",
-                "score": 0,
-                "evidence": [
-                    {
-                        "source": "notion.search",
-                        "text": "Notion policy search completed without strong policy keyword matches.",
-                        "url": None,
-                    }
-                ],
-                "recommendation": "Verify policy coverage manually if this repo handles sensitive data.",
             }
         )
 
@@ -2154,34 +2562,14 @@ def build_agent_findings(
                     "recommendation": "Resolve blockers before deploying to production.",
                 }
             )
-        elif pull_rows or commit_rows:
-            findings.append(
-                {
-                    "type": "release_readiness_context",
-                    "title": "Release readiness reviewed from recent pull requests and commits",
-                    "severity": "informational",
-                    "score": 5,
-                    "evidence": [
-                        {
-                            "source": "github.pulls" if pull_rows else "github.commits",
-                            "text": (
-                                f"Reviewed {len(pull_rows)} recent PR(s) and {len(commit_rows)} commit(s) "
-                                "for release risk indicators."
-                            ),
-                            "url": None,
-                        }
-                    ],
-                    "recommendation": "Combine this signal with dependency and secret scans before deploying.",
-                }
-            )
-            
+
     slack_rows = first_rows(by_name.get("slack_security_discussion", {}), limit=3)
     for finding in findings:
         if policy_rows:
             finding["policy_context"] = [
                 {
                     "source": "notion.search",
-                    "text": row.get("title") or row.get("url") or row.get("id"),
+                    "text": notion_row_display_title(row),
                     "url": row.get("url"),
                 }
                 for row in policy_rows
@@ -2353,6 +2741,8 @@ def build_evidence_graph(
         }
 
     for index, finding in enumerate(findings, start=1):
+        if not is_actionable_finding(finding):
+            continue
         # We DO NOT create a finding node in the graph anymore.
         # Instead, we construct the causal chain from the evidence.
         
@@ -2424,6 +2814,9 @@ def build_evidence_graph(
             elif source == "github.search_code":
                 node["type"] = "code_search_result"
                 other_evidence.append(evidence_id)
+            elif source == "notion.search":
+                # Policy docs render as POLICY nodes via policy_context, not EVIDENCE.
+                continue
             else:
                 node["type"] = "evidence"
                 other_evidence.append(evidence_id)
@@ -2706,29 +3099,34 @@ def agent_plan(req: AgentInvestigationReq) -> dict[str, object]:
     """Dry-run planner endpoint: discovers capabilities and returns the investigation
     plan without executing any Coral queries.  Useful for debugging and the frontend
     Coral capability panel."""
-    started_at = time.perf_counter()
-    logger.info(
-        "endpoint.agent_plan.start owner=%s repo=%s question=%s",
-        req.owner,
-        req.repo,
-        compact_text(req.question),
-    )
-    capabilities = discover_capabilities()
-    plan = plan_with_orchestrator(req, capabilities)
-    duration_ms = elapsed_ms(started_at)
-    logger.info(
-        "endpoint.agent_plan.done duration_ms=%s selected_tools=%s planner=%s",
-        duration_ms,
-        len(plan.get("selected_tools", [])),
-        plan.get("planner_source"),
-    )
-    return {
-        "question": req.question,
-        "plan": plan,
-        "capability_summary": capabilities["summary"],
-        "capabilities": capabilities,
-        "duration_ms": duration_ms,
-    }
+    with coral_credentials_context(
+        github_token=req.github_token,
+        notion_api_key=req.notion_api_key,
+        slack_token=req.slack_token,
+    ):
+        started_at = time.perf_counter()
+        logger.info(
+            "endpoint.agent_plan.start owner=%s repo=%s question=%s",
+            req.owner,
+            req.repo,
+            compact_text(req.question),
+        )
+        capabilities = discover_capabilities()
+        plan = plan_with_orchestrator(req, capabilities)
+        duration_ms = elapsed_ms(started_at)
+        logger.info(
+            "endpoint.agent_plan.done duration_ms=%s selected_tools=%s planner=%s",
+            duration_ms,
+            len(plan.get("selected_tools", [])),
+            plan.get("planner_source"),
+        )
+        return {
+            "question": req.question,
+            "plan": plan,
+            "capability_summary": capabilities["summary"],
+            "capabilities": capabilities,
+            "duration_ms": duration_ms,
+        }
 
 
 @app.get("/health")
@@ -2760,7 +3158,21 @@ def sources() -> dict[str, object]:
 
 
 @app.get("/agent/capabilities")
-def agent_capabilities() -> dict[str, object]:
+def agent_capabilities_get() -> dict[str, object]:
+    return build_agent_capabilities_response()
+
+
+@app.post("/agent/capabilities")
+def agent_capabilities_post(req: SourceCredentials) -> dict[str, object]:
+    with coral_credentials_context(
+        github_token=req.github_token,
+        notion_api_key=req.notion_api_key,
+        slack_token=req.slack_token,
+    ):
+        return build_agent_capabilities_response()
+
+
+def build_agent_capabilities_response() -> dict[str, object]:
     logger.info("endpoint.agent_capabilities.start")
     capabilities = discover_capabilities()
     logger.info(
@@ -2932,7 +3344,12 @@ def package_investigation(req: PackageInvestigationReq) -> dict[str, object]:
 
 @app.post("/agent/investigate")
 def agent_investigate(req: AgentInvestigationReq) -> dict[str, object]:
-    return agent_investigate_internal(req)
+    with coral_credentials_context(
+        github_token=req.github_token,
+        notion_api_key=req.notion_api_key,
+        slack_token=req.slack_token,
+    ):
+        return agent_investigate_internal(req)
 
 
 @app.post("/agent/investigate/stream")
@@ -2941,8 +3358,13 @@ def agent_investigate_stream(req: AgentInvestigationReq):
 
     def worker() -> None:
         try:
-            result = agent_investigate_internal(req, progress_queue=q)
-            q.put({"type": "complete", "data": result})
+            with coral_credentials_context(
+                github_token=req.github_token,
+                notion_api_key=req.notion_api_key,
+                slack_token=req.slack_token,
+            ):
+                result = agent_investigate_internal(req, progress_queue=q)
+                q.put({"type": "complete", "data": result})
         except Exception as e:
             logger.exception("agent_investigate_stream worker failed")
             q.put({"type": "error", "error": str(e)})
@@ -2993,7 +3415,6 @@ def agent_investigate_internal(
         owner = sql_string(req.owner)
         repo = sql_string(req.repo)
         org = sql_string(req.org or req.owner)
-        policy_query = sql_string(req.policy_query)
 
         github_recent_pulls_sql = f"""
         SELECT number, title, body, state, user__login, created_at, updated_at, merged_at, html_url, url
@@ -3026,15 +3447,9 @@ def agent_investigate_internal(
             req.repo,
             secrets_focus=question_intent["secrets"],
         )
-        notion_policy_context_sql = f"""
-        SELECT id, object, url, public_url, raw
-        FROM notion.search
-        WHERE query = '{policy_query}'
-        LIMIT 5
-        """
-
         emit("Discovering capabilities and connected sources...")
         capabilities = discover_capabilities()
+        require_github_for_investigation(capabilities)
         emit(f"Discovered {len(capabilities.get('tools', []))} available tools")
         metadata_steps = capabilities.get("metadata_steps", [])
         emit("Planning investigation...")
@@ -3214,7 +3629,7 @@ def agent_investigate_internal(
             or "notion.search" in selected_tools
         )
         if run_policy_search:
-            steps.append(query_step("notion_policy_context", notion_policy_context_sql))
+            steps.append(fetch_notion_policy_step(req.policy_query, req.question))
         else:
             skipped = next(
                 (
@@ -3456,11 +3871,16 @@ def agent_investigate_internal(
                         scan_results.append(bundle)
 
         emit("Synthesizing findings...")
-        findings = build_agent_findings(analysis_req, steps, scan_results)
+        all_findings = build_agent_findings(analysis_req, steps, scan_results)
         review_signals = build_review_signals(analysis_req, steps)
+        findings = [f for f in all_findings if is_actionable_finding(f)]
+        scan_coverage = build_scan_coverage(steps, question_intent)
         evidence_graph = build_evidence_graph(analysis_req, findings)
-        max_score = max([int(finding["score"]) for finding in findings], default=0)
-        risk_level = level_from_score(max_score)
+        max_score, risk_level = compute_investigation_risk(
+            req.question,
+            all_findings,
+            review_signals,
+        )
         failed_steps = [step for step in steps if not step.get("ok")]
         total_duration_ms = elapsed_ms(started_at)
         debug_timeline = build_debug_timeline(
@@ -3477,11 +3897,12 @@ def agent_investigate_internal(
             f"Generated {len(findings)} confirmed finding(s) and {len(review_signals)} review signal(s).",
         ]
         logger.info(
-            "endpoint.agent_investigate.done duration_ms=%s risk=%s score=%s findings=%s failed_steps=%s",
+            "endpoint.agent_investigate.done duration_ms=%s risk=%s score=%s findings=%s coverage=%s failed_steps=%s",
             total_duration_ms,
             risk_level,
             max_score,
             len(findings),
+            len(scan_coverage),
             len(failed_steps),
         )
 
@@ -3492,15 +3913,17 @@ def agent_investigate_internal(
                 len(review_signals),
                 selected_package_text,
                 req.question,
-                findings,
+                all_findings,
             ),
             "target_package": deep_scan_target,
             "package_candidate": package_target,
             "package_extraction": extraction,
             "risk_level": risk_level,
             "score": max_score,
+            "investigation_mode": primary_investigation_mode(req.question),
             "findings": findings,
             "review_signals": review_signals,
+            "scan_coverage": scan_coverage,
             "evidence_graph": evidence_graph,
             "reasoning_trace": reasoning_trace,
             "planner": plan,

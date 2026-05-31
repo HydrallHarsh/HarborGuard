@@ -7,7 +7,7 @@ import threading
 import time
 from typing import Any
 
-from coral_client import coral_env, load_dotenv
+from coral_client import coral_env, load_dotenv, resolve_coral_bin, resolve_coral_config_dir
 
 logger = logging.getLogger("harborguard.mcp")
 
@@ -23,8 +23,8 @@ def mcp_discovery_enabled() -> bool:
 class CoralMCPClient:
     def __init__(self) -> None:
         load_dotenv()
-        self.coral_bin = os.getenv("CORAL_BIN", "coral")
-        self.config_dir = os.getenv("CORAL_CONFIG_DIR") or None
+        self.coral_bin = resolve_coral_bin()
+        self.config_dir = resolve_coral_config_dir()
         self.timeout_seconds = float(os.getenv("CORAL_MCP_TIMEOUT_SECONDS", "8"))
         self.next_id = 1
         self.process: subprocess.Popen[str] | None = None
