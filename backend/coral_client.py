@@ -2,6 +2,7 @@ import json
 import logging
 import os
 import subprocess
+import threading
 import time
 import contextvars
 from contextlib import contextmanager
@@ -9,6 +10,8 @@ from dataclasses import dataclass
 from pathlib import Path
 
 logger = logging.getLogger("harborguard.coral")
+
+_coral_lock = threading.Lock()
 
 _coral_credential_overrides: contextvars.ContextVar[dict[str, str] | None] = contextvars.ContextVar(
     "coral_credential_overrides",
@@ -146,7 +149,21 @@ class CoralClient:
         self.coral_bin = resolve_coral_bin()
         self.config_dir = resolve_coral_config_dir()
         self.timeout_seconds = float(os.getenv("CORAL_QUERY_TIMEOUT_SECONDS", "20"))
+        self.source_add_timeout_seconds = float(
+            os.getenv("CORAL_SOURCE_ADD_TIMEOUT_SECONDS", "45")
+        )
         logger.info("coral.client.init bin=%s config_dir=%s", self.coral_bin, self.config_dir)
+
+    def _run(self, command: list[str], timeout: float) -> subprocess.CompletedProcess[str]:
+        with _coral_lock:
+            return subprocess.run(
+                command,
+                env=coral_env(self.config_dir),
+                text=True,
+                capture_output=True,
+                check=False,
+                timeout=timeout,
+            )
 
     def query(self, sql: str, timeout_seconds: float | None = None) -> CoralResult:
         command = [self.coral_bin, "sql", "--format", "json", sql]
@@ -159,14 +176,7 @@ class CoralClient:
         )
 
         try:
-            completed = subprocess.run(
-                command,
-                env=coral_env(self.config_dir),
-                text=True,
-                capture_output=True,
-                check=False,
-                timeout=timeout,
-            )
+            completed = self._run(command, timeout)
         except subprocess.TimeoutExpired as error:
             duration_ms = elapsed_ms(started_at)
             logger.warning(
@@ -215,13 +225,9 @@ class CoralClient:
     def source_list(self) -> CoralCommandResult:
         started_at = time.perf_counter()
         logger.info("coral.source_list.start timeout=%ss", f"{self.timeout_seconds:g}")
-        completed = subprocess.run(
+        completed = self._run(
             [self.coral_bin, "source", "list"],
-            env=coral_env(self.config_dir),
-            text=True,
-            capture_output=True,
-            check=False,
-            timeout=self.timeout_seconds,
+            self.timeout_seconds,
         )
         logger.info(
             "coral.source_list.done duration_ms=%s returncode=%s",
@@ -236,17 +242,15 @@ class CoralClient:
 
     def source_add(self, source_name: str, timeout_seconds: float | None = None) -> CoralCommandResult:
         """Register a bundled Coral source (github, slack, notion). Reads tokens from env."""
-        timeout = timeout_seconds or self.timeout_seconds
+        timeout = timeout_seconds or self.source_add_timeout_seconds
         started_at = time.perf_counter()
         logger.info("coral.source_add.start source=%s timeout=%ss", source_name, f"{timeout:g}")
-        completed = subprocess.run(
-            [self.coral_bin, "source", "add", source_name],
-            env=coral_env(self.config_dir),
-            text=True,
-            capture_output=True,
-            check=False,
-            timeout=timeout,
-        )
+        try:
+            completed = self._run([self.coral_bin, "source", "add", source_name], timeout)
+        except subprocess.TimeoutExpired as error:
+            raise CoralClientError(
+                f"coral source add {source_name} timed out after {timeout:g}s"
+            ) from error
         logger.info(
             "coral.source_add.done source=%s duration_ms=%s returncode=%s",
             source_name,
@@ -265,21 +269,22 @@ class CoralClient:
         timeout_seconds: float | None = None,
     ) -> CoralCommandResult:
         """Register a community source from a manifest YAML file."""
-        timeout = timeout_seconds or self.timeout_seconds
+        timeout = timeout_seconds or self.source_add_timeout_seconds
         started_at = time.perf_counter()
         logger.info(
             "coral.source_add_file.start path=%s timeout=%ss",
             manifest_path,
             f"{timeout:g}",
         )
-        completed = subprocess.run(
-            [self.coral_bin, "source", "add", "--file", manifest_path],
-            env=coral_env(self.config_dir),
-            text=True,
-            capture_output=True,
-            check=False,
-            timeout=timeout,
-        )
+        try:
+            completed = self._run(
+                [self.coral_bin, "source", "add", "--file", manifest_path],
+                timeout,
+            )
+        except subprocess.TimeoutExpired as error:
+            raise CoralClientError(
+                f"coral source add --file timed out after {timeout:g}s"
+            ) from error
         logger.info(
             "coral.source_add_file.done path=%s duration_ms=%s returncode=%s",
             manifest_path,

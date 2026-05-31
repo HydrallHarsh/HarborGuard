@@ -332,8 +332,12 @@ def connect_result_payload(
 
 def ensure_community_sources() -> list[dict[str, object]]:
     """Register osv and deps_dev community manifests (no tokens required)."""
+    installed = installed_coral_schemas()
     results: list[dict[str, object]] = []
     for source_name, manifest_path in community_source_manifests():
+        if source_name in installed:
+            results.append({"source": source_name, "ok": True, "skipped": True, "reason": "already installed"})
+            continue
         try:
             result = coral.source_add_file(str(manifest_path))
             payload = connect_result_payload(source_name, result)
@@ -358,10 +362,25 @@ def ensure_community_sources() -> list[dict[str, object]]:
     return results
 
 
-def connect_token_sources(required_only: bool = False) -> list[dict[str, object]]:
+def connect_token_sources(
+    required_only: bool = False,
+    *,
+    skip_installed: bool = False,
+) -> list[dict[str, object]]:
     """Run `coral source add` for bundled sources when credentials are present."""
+    installed = installed_coral_schemas() if skip_installed else set()
     results: list[dict[str, object]] = []
     for source_name, env_key in BUNDLED_TOKEN_SOURCES.items():
+        if skip_installed and source_name in installed:
+            results.append(
+                {
+                    "source": source_name,
+                    "ok": True,
+                    "skipped": True,
+                    "reason": "already installed",
+                }
+            )
+            continue
         token = get_credential(env_key)
         if not token:
             payload = connect_result_payload(
@@ -388,27 +407,76 @@ def connect_token_sources(required_only: bool = False) -> list[dict[str, object]
                 )
             logger.info("sources.token.ok source=%s", source_name)
             results.append(payload)
-        except Exception as error:
+        except (CoralClientError, RuntimeError) as error:
             logger.warning("sources.token.error source=%s error=%s", source_name, error)
             results.append({"source": source_name, "ok": False, "error": str(error)})
             if required_only and source_name == "github":
-                raise
+                raise RuntimeError(str(error)) from error
     return results
 
 
 def connect_all_coral_sources(*, required: bool = False) -> dict[str, object]:
     """Register community + token-backed Coral sources."""
-    ensure_community_sources()
-    token_results = connect_token_sources(required_only=required)
-    # Re-register community manifests after token sources — bundled `source add`
-    # can reset Coral workspace metadata on some installs.
-    community = ensure_community_sources()
+    installed = installed_coral_schemas()
+    if not REQUIRED_INVESTIGATION_SOURCES.issubset(installed):
+        ensure_community_sources()
+    token_results = connect_token_sources(required_only=required, skip_installed=True)
+    if not REQUIRED_INVESTIGATION_SOURCES.issubset(installed_coral_schemas()):
+        ensure_community_sources()
+    community = [{"source": name, "ok": name in installed_coral_schemas()} for name in ("osv", "deps_dev")]
     return {
         "community": community,
         "token_sources": token_results,
-        "all_ok": all(item.get("ok") for item in token_results if not item.get("skipped"))
-        and all(item.get("ok") for item in community),
+        "all_ok": all(item.get("ok") for item in token_results if not item.get("skipped")),
     }
+
+
+def installed_coral_schemas() -> set[str]:
+    """Lightweight check — which source schemas are already registered."""
+    try:
+        source_list = ", ".join(f"'{source}'" for source in REQUIRED_SOURCES)
+        result = coral.query(
+            f"SELECT DISTINCT schema_name FROM coral.tables WHERE schema_name IN ({source_list})",
+            timeout_seconds=float(os.getenv("CORAL_SCHEMA_CHECK_TIMEOUT_SECONDS", "12")),
+        )
+        return {
+            str(row.get("schema_name"))
+            for row in result.rows
+            if row.get("schema_name")
+        }
+    except CoralClientError as error:
+        logger.warning("sources.schema_check.failed error=%s", compact_text(str(error)))
+        return set()
+
+
+def ensure_investigation_sources_ready() -> None:
+    """Connect only missing sources — skip heavy re-install when already registered."""
+    installed = installed_coral_schemas()
+    missing_required = [
+        source for source in REQUIRED_INVESTIGATION_SOURCES if source not in installed
+    ]
+    if missing_required:
+        logger.info("sources.ensure.missing required=%s", missing_required)
+        connect_all_coral_sources(required=True)
+        return
+    if not get_credential("GITHUB_TOKEN"):
+        raise RuntimeError(
+            "GitHub token required. Paste GITHUB_TOKEN in the UI or set it on the server."
+        )
+    for source_name in OPTIONAL_TOKEN_SOURCES:
+        env_key = BUNDLED_TOKEN_SOURCES[source_name]
+        if get_credential(env_key) and source_name not in installed:
+            try:
+                result = coral.source_add(source_name)
+                payload = connect_result_payload(source_name, result)
+                if not payload.get("ok"):
+                    logger.warning(
+                        "sources.optional_add.failed source=%s message=%s",
+                        source_name,
+                        payload.get("message"),
+                    )
+            except CoralClientError as error:
+                logger.warning("sources.optional_add.error source=%s error=%s", source_name, error)
 
 
 def sources_investigation_ready(capabilities: dict[str, object]) -> bool:
@@ -1993,7 +2061,7 @@ def compact_text(text: str, limit: int = 320) -> str:
 
 
 def query_capability_metadata() -> list[dict[str, object]]:
-    metadata_timeout = float(os.getenv("CORAL_METADATA_TIMEOUT_SECONDS", "6"))
+    metadata_timeout = float(os.getenv("CORAL_METADATA_TIMEOUT_SECONDS", "12"))
     source_list = ", ".join(f"'{source}'" for source in REQUIRED_SOURCES)
     tool_tables = sorted(
         {
@@ -3646,7 +3714,7 @@ def agent_investigate_stream(req: AgentInvestigationReq):
                 q.put({"type": "complete", "data": result})
         except Exception as e:
             logger.exception("agent_investigate_stream worker failed")
-            q.put({"type": "error", "error": str(e)})
+            q.put({"type": "error", "error": str(e) or "Investigation failed"})
 
     threading.Thread(target=worker, daemon=True).start()
 
@@ -3726,11 +3794,8 @@ def agent_investigate_internal(
             req.repo,
             secrets_focus=question_intent["secrets"],
         )
-        emit("Connecting Coral sources (github, slack, notion, osv, deps_dev)...")
-        try:
-            connect_all_coral_sources(required=True)
-        except RuntimeError as error:
-            raise RuntimeError(str(error)) from error
+        emit("Verifying Coral sources...")
+        ensure_investigation_sources_ready()
         emit("Discovering capabilities and connected sources...")
         capabilities = discover_capabilities()
         require_sources_for_investigation(capabilities)

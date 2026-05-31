@@ -9,7 +9,6 @@ import { SchemaPanel } from "../components/SchemaPanel";
 import { apiUrl, getApiBase } from "../utils/api";
 import {
   credentialsPayload,
-  ensureSourcesReady,
   fetchCapabilitiesJson,
   isLlmPlannerReady,
   loadSourceCredentials,
@@ -175,7 +174,10 @@ function DashboardContent() {
     }
   }
 
-  useEffect(() => { void refreshCapabilities(); }, []);
+  useEffect(() => {
+    if (historyId) return;
+    void refreshCapabilities();
+  }, [historyId]);
 
   const latestQueryName =
     liveQueries.length > 0 ? liveQueries[liveQueries.length - 1]?.name : undefined;
@@ -256,12 +258,6 @@ function DashboardContent() {
     setLiveSteps(["Initializing investigation..."]);
     setLiveQueries([]);
     const creds = loadSourceCredentials();
-    const sourceCheck = await ensureSourcesReady(getApiBase(), creds);
-    if (!sourceCheck.ok) {
-      setError(sourceCheck.message);
-      setLoading(false);
-      return;
-    }
     let llmStatus = capabilities?.llm_planner;
     if (creds.use_llm_planner) {
       try {
@@ -361,7 +357,6 @@ function DashboardContent() {
         setError("Investigation stream closed unexpectedly. Check backend logs.");
         setLoading(false);
       }
-      void refreshCapabilities();
     } catch (err) {
       setError(err instanceof Error ? err.message : "Investigation failed");
       setLoading(false);
@@ -706,6 +701,27 @@ function DashboardContent() {
   }
 
   // The briefing phase has been moved to the landing page.
+  if (error) {
+    return (
+      <div className="loadingScreen">
+        <motion.div
+          className="loadWrap"
+          initial={{ opacity: 0, y: 12 }}
+          animate={{ opacity: 1, y: 0 }}
+          transition={{ duration: 0.35 }}
+        >
+          <h2 className="loadingTitle">Investigation failed</h2>
+          <p className="wError" style={{ marginTop: 16, maxWidth: 480, textAlign: "center" }}>
+            {error}
+          </p>
+          <button type="button" className="tbBtn" style={{ marginTop: 24 }} onClick={() => router.push("/")}>
+            ← Back to home
+          </button>
+        </motion.div>
+      </div>
+    );
+  }
+
   return null;
 }
 
