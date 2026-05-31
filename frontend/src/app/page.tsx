@@ -11,12 +11,14 @@ import {
   GITHUB_CONNECT_MESSAGE,
   hasGitHubToken,
   isLlmPlannerReady,
+  loadCapabilitiesCache,
   loadSourceCredentials,
   markSourcesConnected,
   OPENROUTER_KEY_PLACEHOLDER,
   OPENROUTER_MODEL_PLACEHOLDER,
   RECOMMENDED_OPENROUTER_MODELS,
   restoreSourceConnection,
+  saveCapabilitiesCache,
   saveSourceCredentials,
   SOURCES_REQUIRED_MESSAGE,
   type CapabilitiesResponse,
@@ -96,6 +98,7 @@ export default function Home() {
       if (!r.ok) throw new Error(`${r.status}`);
       const payload = (await r.json()) as CapabilitiesResponse;
       setCapabilities(payload);
+      saveCapabilitiesCache(creds, payload);
       setError(null);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Could not load capabilities");
@@ -106,6 +109,14 @@ export default function Home() {
     setHistory(loadInvestigationHistory());
     const saved = loadSourceCredentials();
     setCredentials(saved);
+
+    const cached = loadCapabilitiesCache(saved);
+    if (cached) {
+      setCapabilities(cached);
+      setRestoringSources(false);
+      return;
+    }
+
     void (async () => {
       setRestoringSources(true);
       const restored = await restoreSourceConnection(getApiBase(), saved);
@@ -149,14 +160,11 @@ export default function Home() {
   }
 
   function loadDemoRepo() {
-    const question = "Did dependency upgrades introduce risk and require policy review?";
-    setSelectedCaseId("dep");
     setForm({
       ...form,
       owner: DEMO_REPO.owner,
       repo: DEMO_REPO.repo,
       org: DEMO_REPO.org,
-      question,
     });
   }
 

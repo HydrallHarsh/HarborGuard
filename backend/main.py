@@ -2218,7 +2218,6 @@ def require_github_for_investigation(capabilities: dict[str, object]) -> None:
 
 def discover_capabilities() -> dict[str, object]:
     started_at = time.perf_counter()
-    ensure_community_sources()
     backend = "coral_mcp_with_sql_fallback" if mcp_discovery_enabled() else "coral_sql_metadata"
     logger.info("capabilities.discovery.start backend=%s", backend)
     metadata_steps = (

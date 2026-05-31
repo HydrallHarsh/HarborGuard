@@ -63,6 +63,73 @@ export const RECOMMENDED_OPENROUTER_MODELS = [
 const STORAGE_KEY = "harborguard_source_credentials";
 const LEGACY_SESSION_KEY = STORAGE_KEY;
 const SOURCES_CONNECTED_AT_KEY = "harborguard_sources_connected_at";
+const CAPABILITIES_CACHE_KEY = "harborguard_capabilities_cache";
+
+/** Use cached source status on home — avoid re-running Coral connect every visit. */
+const CAPABILITIES_CACHE_TTL_MS = 15 * 60 * 1000;
+/** After a successful Connect, skip auto-reconnect for this long unless user clicks Connect again. */
+const SOURCES_AUTO_RECONNECT_COOLDOWN_MS = 30 * 60 * 1000;
+
+type CapabilitiesCacheEntry = {
+  at: number;
+  fingerprint: string;
+  payload: CapabilitiesResponse;
+};
+
+function credentialsFingerprint(credentials: SourceCredentials): string {
+  const parts = [
+    credentials.github_token ?? "",
+    credentials.notion_api_key ?? "",
+    credentials.slack_token ?? "",
+  ];
+  return parts.map(p => (p ? "1" : "0")).join("");
+}
+
+export function loadSourcesConnectedAt(): number | null {
+  if (typeof window === "undefined") return null;
+  const raw = localStorage.getItem(SOURCES_CONNECTED_AT_KEY);
+  if (!raw) return null;
+  const value = Number(raw);
+  return Number.isFinite(value) ? value : null;
+}
+
+export function loadCapabilitiesCache(
+  credentials: SourceCredentials = loadSourceCredentials(),
+): CapabilitiesResponse | null {
+  if (typeof window === "undefined") return null;
+  try {
+    const raw = localStorage.getItem(CAPABILITIES_CACHE_KEY);
+    if (!raw) return null;
+    const entry = JSON.parse(raw) as CapabilitiesCacheEntry;
+    if (!entry?.payload || entry.fingerprint !== credentialsFingerprint(credentials)) {
+      return null;
+    }
+    if (Date.now() - entry.at > CAPABILITIES_CACHE_TTL_MS) {
+      return null;
+    }
+    return entry.payload;
+  } catch {
+    return null;
+  }
+}
+
+export function saveCapabilitiesCache(
+  credentials: SourceCredentials,
+  payload: CapabilitiesResponse,
+): void {
+  if (typeof window === "undefined") return;
+  const entry: CapabilitiesCacheEntry = {
+    at: Date.now(),
+    fingerprint: credentialsFingerprint(credentials),
+    payload,
+  };
+  localStorage.setItem(CAPABILITIES_CACHE_KEY, JSON.stringify(entry));
+}
+
+export function clearCapabilitiesCache(): void {
+  if (typeof window === "undefined") return;
+  localStorage.removeItem(CAPABILITIES_CACHE_KEY);
+}
 
 function readStorage(store: Storage): SourceCredentials {
   try {
@@ -179,24 +246,37 @@ export function markSourcesConnected(): void {
 export function clearSourcesConnectedMark(): void {
   if (typeof window === "undefined") return;
   localStorage.removeItem(SOURCES_CONNECTED_AT_KEY);
+  clearCapabilitiesCache();
 }
 
-/** Reconnect Coral sources on page load when the user already connected once. */
+function sourcesRecentlyConnected(): boolean {
+  const at = loadSourcesConnectedAt();
+  if (!at) return false;
+  return Date.now() - at < SOURCES_AUTO_RECONNECT_COOLDOWN_MS;
+}
+
+/** Fast path for home: use cache when valid; only hit API or reconnect when needed. */
 export async function restoreSourceConnection(
   apiBase: string,
   credentials: SourceCredentials = loadSourceCredentials(),
 ): Promise<CapabilitiesResponse | null> {
   const base = normalizeApiBase(apiBase);
+  const cached = loadCapabilitiesCache(credentials);
+  const cachedSources = cached?.capabilities?.sources ?? {};
 
-  async function fetchAndCheck(): Promise<CapabilitiesResponse | null> {
+  if (cached && areSourcesReady(cachedSources, credentials)) {
+    return cached;
+  }
+
+  async function fetchCapabilitiesPayload(): Promise<CapabilitiesResponse | null> {
     try {
       const response = await fetchCapabilities(base, credentials);
       if (!response.ok) return null;
       const payload = (await response.json()) as CapabilitiesResponse;
+      saveCapabilitiesCache(credentials, payload);
       const sources = payload?.capabilities?.sources ?? {};
       if (areSourcesReady(sources, credentials)) {
         markSourcesConnected();
-        return payload;
       }
       return payload;
     } catch {
@@ -204,21 +284,26 @@ export async function restoreSourceConnection(
     }
   }
 
-  const current = await fetchAndCheck();
+  const current = await fetchCapabilitiesPayload();
   if (current && areSourcesReady(current.capabilities?.sources ?? {}, credentials)) {
     return current;
   }
 
   if (!hasGitHubToken(credentials)) {
+    return current ?? cached;
+  }
+
+  if (sourcesRecentlyConnected() && current) {
     return current;
   }
 
   const connect = await connectSources(base, credentials);
-    if (connect.ok) {
-      if (connect.ready) markSourcesConnected();
-      return connect.capabilities;
+  if (connect.ok) {
+    if (connect.ready) markSourcesConnected();
+    saveCapabilitiesCache(credentials, connect.capabilities);
+    return connect.capabilities;
   }
-  return current;
+  return current ?? cached;
 }
 
 export function isLlmPlannerReady(
@@ -263,15 +348,17 @@ export async function connectSources(
       return { ok: false, message };
     }
     if (data.ready) markSourcesConnected();
+    const capabilities: CapabilitiesResponse = {
+      capabilities: data.capabilities,
+      required_sources: data.required_sources,
+      optional_sources: data.optional_sources,
+    };
+    saveCapabilitiesCache(credentials, capabilities);
     return {
       ok: true,
       ready: Boolean(data.ready),
       missing: Array.isArray(data.missing_sources) ? data.missing_sources : [],
-      capabilities: {
-        capabilities: data.capabilities,
-        required_sources: data.required_sources,
-        optional_sources: data.optional_sources,
-      },
+      capabilities,
     };
   } catch {
     return { ok: false, message: "Could not reach the API to connect Coral sources." };
@@ -285,42 +372,21 @@ export async function ensureSourcesReady(
   | { ok: true; sources: CapabilitiesSources }
   | { ok: false; message: string }
 > {
-  const base = normalizeApiBase(apiBase);
-  try {
-    const response = await fetchCapabilities(base, credentials);
-    if (response.ok) {
-      const payload = await response.json();
-      const sources = (payload?.capabilities?.sources ?? {}) as CapabilitiesSources;
-      if (areSourcesReady(sources, credentials)) {
-        return { ok: true, sources };
-      }
-    }
-  } catch {
-    /* fall through to connect */
+  const cached = loadCapabilitiesCache(credentials);
+  if (cached && areSourcesReady(cached.capabilities?.sources ?? {}, credentials)) {
+    return { ok: true, sources: cached.capabilities?.sources ?? {} };
   }
 
-  const connect = await connectSources(base, credentials);
-  if (!connect.ok) {
-    return { ok: false, message: connect.message };
+  const restored = await restoreSourceConnection(apiBase, credentials);
+  if (restored && areSourcesReady(restored.capabilities?.sources ?? {}, credentials)) {
+    return { ok: true, sources: restored.capabilities?.sources ?? {} };
   }
-  if (!connect.ready) {
-    const missing = connect.missing.length ? connect.missing.join(", ") : "unknown";
-    return {
-      ok: false,
-      message: `Sources still not ready after connect: ${missing}. Check tokens and retry.`,
-    };
-  }
-  try {
-    const response = await fetchCapabilities(base, credentials);
-    if (!response.ok) {
-      return { ok: false, message: `Could not verify sources (${response.status}).` };
-    }
-    const payload = await response.json();
-    const sources = (payload?.capabilities?.sources ?? {}) as CapabilitiesSources;
-    return { ok: true, sources };
-  } catch {
-    return { ok: false, message: "Could not reach the API to verify connected sources." };
-  }
+
+  return {
+    ok: false,
+    message:
+      "Sources not ready. Go home, click Connect Sources, then try again.",
+  };
 }
 
 export async function ensureGitHubReady(
