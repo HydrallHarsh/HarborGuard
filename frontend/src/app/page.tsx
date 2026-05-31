@@ -3,6 +3,7 @@
 import { FormEvent, useCallback, useEffect, useState } from "react";
 import { motion, AnimatePresence } from "motion/react";
 import { useRouter } from "next/navigation";
+import { getApiBase } from "./utils/api";
 import {
   fetchCapabilities,
   isGitHubReady,
@@ -21,8 +22,6 @@ import {
   pickRandom,
   type InvestigationMode,
 } from "./utils/flavor";
-
-const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://127.0.0.1:8000";
 
 type SourceCapabilities = { available?: boolean; configured?: boolean; tools?: string[] };
 type CapabilitiesResponse = {
@@ -72,7 +71,7 @@ export default function Home() {
 
   async function refreshCapabilities(creds: SourceCredentials = credentials) {
     try {
-      const r = await fetchCapabilities(API_BASE, creds);
+      const r = await fetchCapabilities(getApiBase(), creds);
       if (!r.ok) throw new Error(`${r.status}`);
       setCapabilities(await r.json());
       setError(null);

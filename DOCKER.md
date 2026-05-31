@@ -54,6 +54,8 @@ curl http://localhost:10000/agent/capabilities
 NEXT_PUBLIC_API_BASE_URL=https://your-api.example.com
 ```
 
+No trailing slash (the app strips it, but prefer without): `https://harborguard-api.onrender.com` not `...com/`.
+
 Redeploy Vercel after setting this.
 
 ## Host on Render / Railway / Fly.io

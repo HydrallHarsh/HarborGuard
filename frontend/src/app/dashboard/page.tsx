@@ -6,6 +6,7 @@ import { useSearchParams, useRouter } from "next/navigation";
 import { EvidenceGraph } from "../components/EvidenceGraph";
 import { LoadingQuipDisplay } from "../components/LoadingQuipDisplay";
 import { SchemaPanel } from "../components/SchemaPanel";
+import { apiUrl, getApiBase } from "../utils/api";
 import {
   credentialsPayload,
   ensureGitHubReady,
@@ -21,8 +22,6 @@ import {
   DEFAULT_LOADING_QUIP,
   type LoadingQuipContext,
 } from "../utils/flavor";
-
-const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://127.0.0.1:8000";
 
 /* ─── Types ─── */
 type SourceCapabilities = { available?: boolean; configured?: boolean; tools?: string[] };
@@ -161,7 +160,7 @@ function DashboardContent() {
 
   async function refreshCapabilities(creds?: SourceCredentials) {
     try {
-      const r = await fetchCapabilities(API_BASE, creds ?? loadSourceCredentials());
+      const r = await fetchCapabilities(getApiBase(), creds ?? loadSourceCredentials());
       if (!r.ok) throw new Error(`${r.status}`);
       setCapabilities(await r.json());
     } catch (err) {
@@ -232,7 +231,7 @@ function DashboardContent() {
     setLiveSteps(["Initializing investigation..."]);
     setLiveQueries([]);
     const creds = loadSourceCredentials();
-    const githubCheck = await ensureGitHubReady(API_BASE, creds);
+    const githubCheck = await ensureGitHubReady(getApiBase(), creds);
     if (!githubCheck.ok) {
       setError(githubCheck.message);
       setLoading(false);
@@ -247,7 +246,7 @@ function DashboardContent() {
       ...credentialsPayload(creds),
     };
     try {
-      const r = await fetch(`${API_BASE}/agent/investigate/stream`, {
+      const r = await fetch(apiUrl("/agent/investigate/stream"), {
         method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify(payload),
       });

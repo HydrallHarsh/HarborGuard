@@ -1,5 +1,6 @@
 import React, { useEffect, useState } from 'react';
 import { motion, AnimatePresence } from 'motion/react';
+import { apiUrl } from '../utils/api';
 
 interface ColumnDef {
   column_name: string;
@@ -41,7 +42,7 @@ export function SchemaPanel({ isOpen, onClose }: SchemaPanelProps) {
   useEffect(() => {
     if (isOpen && !data) {
       setLoading(true);
-      fetch('http://127.0.0.1:8000/agent/capabilities')
+      fetch(apiUrl('/agent/capabilities'))
         .then((r) => r.json())
         .then((res) => {
           setData(res.capabilities);
