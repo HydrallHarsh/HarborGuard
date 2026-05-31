@@ -418,10 +418,10 @@ def connect_token_sources(
 def connect_all_coral_sources(*, required: bool = False) -> dict[str, object]:
     """Register community + token-backed Coral sources."""
     installed = installed_coral_schemas()
-    if not REQUIRED_INVESTIGATION_SOURCES.issubset(installed):
+    if not set(REQUIRED_INVESTIGATION_SOURCES).issubset(installed):
         ensure_community_sources()
     token_results = connect_token_sources(required_only=required, skip_installed=True)
-    if not REQUIRED_INVESTIGATION_SOURCES.issubset(installed_coral_schemas()):
+    if not set(REQUIRED_INVESTIGATION_SOURCES).issubset(installed_coral_schemas()):
         ensure_community_sources()
     community = [{"source": name, "ok": name in installed_coral_schemas()} for name in ("osv", "deps_dev")]
     return {
