@@ -10,7 +10,6 @@ import {
   fetchCapabilities,
   GITHUB_CONNECT_MESSAGE,
   hasGitHubToken,
-  isLlmPlannerReady,
   loadCapabilitiesCache,
   loadSourceCredentials,
   markSourcesConnected,
@@ -180,11 +179,12 @@ export default function Home() {
   }
 
   const sources = capabilities?.capabilities?.sources ?? {};
-  const llmStatus = capabilities?.llm_planner;
   const githubTokenProvided = hasGitHubToken(credentials);
   const sourcesReady = areSourcesReady(sources, credentials);
-  const llmReady = isLlmPlannerReady(llmStatus, credentials);
-  const canSubmit = form.question.trim() && sourcesReady && llmReady;
+  const hasOpenRouterConfig = Boolean(
+    credentials.openrouter_api_key?.trim() && credentials.openrouter_model?.trim(),
+  );
+  const canSubmit = form.question.trim() && sourcesReady;
 
   async function handleConnectSources() {
     if (!githubTokenProvided) {
@@ -225,13 +225,6 @@ export default function Home() {
       setError(SOURCES_REQUIRED_MESSAGE);
       return;
     }
-    if (!isLlmPlannerReady(llmStatus, credentials)) {
-      setError(
-        "AI planner is enabled — add your OpenRouter API key and model, or turn off the toggle.",
-      );
-      return;
-    }
-
     saveSourceCredentials(credentials);
 
     const params = new URLSearchParams();
@@ -398,12 +391,12 @@ export default function Home() {
             </p>
           </section>
 
-          <section className={`credPanel llmPanel ${credentials.use_llm_planner && llmReady ? "credPanelReady" : ""}`}>
+          <section className={`credPanel llmPanel ${credentials.use_llm_planner ? "credPanelReady" : ""}`}>
             <header className="credPanelHead">
               <div>
                 <h3 className="credPanelTitle">AI planner (OpenRouter)</h3>
                 <p className="credPanelSub">
-                  Smarter tool selection for investigations — optional, uses your OpenRouter account.
+                  Optional smarter planning with OpenRouter. If no key is provided, HarborGuard falls back to deterministic mode.
                 </p>
               </div>
               <span className="credPanelBadge credPanelBadgeRec">Recommended</span>
@@ -420,12 +413,12 @@ export default function Home() {
               <span>Use AI planner (OpenRouter)</span>
             </label>
 
-            {credentials.use_llm_planner && !llmReady && (
+            {credentials.use_llm_planner && !hasOpenRouterConfig && (
               <div className="credAlert" role="status">
-                <span className="credAlertIcon" aria-hidden>!</span>
+                <span className="credAlertIcon" aria-hidden>i</span>
                 <p>
-                  Add an OpenRouter API key and model slug below, or configure{" "}
-                  <code>OPENROUTER_*</code> on the server.
+                  AI planner is selected, but no OpenRouter key/model is set.
+                  HarborGuard will fall back to deterministic planning.
                 </p>
               </div>
             )}
@@ -508,9 +501,7 @@ export default function Home() {
             {!sourcesReady && form.question.trim() && (
               <p className="qFormHint">Connect GitHub (and wait for osv/deps_dev pills) to continue.</p>
             )}
-            {sourcesReady && credentials.use_llm_planner && !llmReady && form.question.trim() && (
-              <p className="qFormHint">Configure OpenRouter above or disable the AI planner toggle.</p>
-            )}
+
           </div>
         </form>
 

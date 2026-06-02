@@ -153,8 +153,8 @@ function writeStorage(store: Storage, credentials: SourceCredentials): void {
   if (credentials.openrouter_model?.trim()) {
     trimmed.openrouter_model = credentials.openrouter_model.trim();
   }
-  if (credentials.use_llm_planner === true) {
-    trimmed.use_llm_planner = true;
+  if (credentials.use_llm_planner !== undefined) {
+    trimmed.use_llm_planner = credentials.use_llm_planner;
   }
   if (Object.keys(trimmed).length === 0) {
     store.removeItem(STORAGE_KEY);
@@ -192,8 +192,7 @@ export function credentialsPayload(credentials: SourceCredentials) {
   if (credentials.slack_token) body.slack_token = credentials.slack_token;
   if (credentials.openrouter_api_key) body.openrouter_api_key = credentials.openrouter_api_key;
   if (credentials.openrouter_model) body.openrouter_model = credentials.openrouter_model;
-  if (credentials.use_llm_planner === true) body.use_llm_planner = true;
-  if (credentials.use_llm_planner === false) body.use_llm_planner = false;
+  body.use_llm_planner = credentials.use_llm_planner === true;
   return body;
 }
 
@@ -204,7 +203,7 @@ export function hasAnyCredentials(credentials: SourceCredentials): boolean {
       credentials.slack_token ||
       credentials.openrouter_api_key ||
       credentials.openrouter_model ||
-      credentials.use_llm_planner,
+      credentials.use_llm_planner !== undefined,
   );
 }
 
@@ -307,13 +306,12 @@ export async function restoreSourceConnection(
 }
 
 export function isLlmPlannerReady(
-  llmStatus: LlmPlannerStatus | undefined,
-  credentials: SourceCredentials = loadSourceCredentials(),
+  _llmStatus: LlmPlannerStatus | undefined,
+  _credentials: SourceCredentials = loadSourceCredentials(),
 ): boolean {
-  if (!credentials.use_llm_planner) return true;
-  if (credentials.openrouter_api_key?.trim() && credentials.openrouter_model?.trim()) return true;
-  if (llmStatus?.configured) return true;
-  return false;
+  // AI planning is optional. If a user enables it without providing a usable
+  // OpenRouter config, the backend falls back to deterministic planning.
+  return true;
 }
 
 export async function connectSources(
