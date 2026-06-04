@@ -68,9 +68,14 @@ def cors_allow_origins() -> list[str]:
     return origins
 
 
+def cors_allow_origin_regex() -> str | None:
+    return os.getenv("HARBORGUARD_CORS_ORIGIN_REGEX", "").strip() or None
+
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=cors_allow_origins(),
+    allow_origin_regex=cors_allow_origin_regex(),
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],

@@ -54,7 +54,8 @@ Users can paste their own tokens and OpenRouter settings in the HarborGuard land
 
 | Variable | Required | Description |
 |----------|----------|-------------|
-| `HARBORGUARD_CORS_ORIGINS` | For Vercel | Comma-separated frontend URLs |
+| `HARBORGUARD_CORS_ORIGINS` | For Vercel | Comma-separated exact frontend URLs |
+| `HARBORGUARD_CORS_ORIGIN_REGEX` | For previews | Regex for dynamic preview URLs, e.g. `^https://harborguard-security(-[a-z0-9-]+)?\\.vercel\\.app$` |
 | `PORT` | Host sets this | Default `10000` (Render/Railway inject `PORT`) |
 | `CORAL_CONFIG_DIR` | Auto | `/data/coral-config` — mount a volume |
 | `CORAL_BIN` | Auto | `coral` on PATH after install |
