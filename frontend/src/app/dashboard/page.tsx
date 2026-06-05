@@ -10,7 +10,6 @@ import { apiUrl, getApiBase } from "../utils/api";
 import {
   credentialsPayload,
   fetchCapabilitiesJson,
-  isLlmPlannerReady,
   loadSourceCredentials,
   type SourceCredentials,
 } from "../utils/credentials";
@@ -258,22 +257,6 @@ function DashboardContent() {
     setLiveSteps(["Initializing investigation..."]);
     setLiveQueries([]);
     const creds = loadSourceCredentials();
-    let llmStatus = capabilities?.llm_planner;
-    if (creds.use_llm_planner) {
-      try {
-        const cap = await fetchCapabilitiesJson(getApiBase(), creds);
-        llmStatus = cap.llm_planner;
-      } catch {
-        /* use cached status */
-      }
-    }
-    if (!isLlmPlannerReady(llmStatus, creds)) {
-      setError(
-        "AI planner is enabled — add OpenRouter key and model on the landing page, or disable the toggle.",
-      );
-      setLoading(false);
-      return;
-    }
     const payload = {
       question, owner, repo, org: org || owner, slack_channel: slack_channel || null,
       policy_query, package_system: package_system || null,
