@@ -11,6 +11,8 @@ export type SourceCredentials = {
   use_llm_planner?: boolean;
 };
 
+export type TokenSourceName = "github" | "notion" | "slack";
+
 export type SourceStatus = {
   available?: boolean;
   configured?: boolean;
@@ -64,6 +66,7 @@ const STORAGE_KEY = "harborguard_source_credentials";
 const LEGACY_SESSION_KEY = STORAGE_KEY;
 const SOURCES_CONNECTED_AT_KEY = "harborguard_sources_connected_at";
 const CAPABILITIES_CACHE_KEY = "harborguard_capabilities_cache";
+const DIRTY_SOURCE_CREDENTIALS_KEY = "harborguard_dirty_source_credentials";
 
 /** Use cached source status on home — avoid re-running Coral connect every visit. */
 const CAPABILITIES_CACHE_TTL_MS = 15 * 60 * 1000;
@@ -129,6 +132,42 @@ export function saveCapabilitiesCache(
 export function clearCapabilitiesCache(): void {
   if (typeof window === "undefined") return;
   localStorage.removeItem(CAPABILITIES_CACHE_KEY);
+}
+
+export function loadDirtySourceCredentials(): TokenSourceName[] {
+  if (typeof window === "undefined") return [];
+  try {
+    const value = JSON.parse(localStorage.getItem(DIRTY_SOURCE_CREDENTIALS_KEY) ?? "[]");
+    if (!Array.isArray(value)) return [];
+    return value.filter(
+      (source): source is TokenSourceName =>
+        source === "github" || source === "notion" || source === "slack",
+    );
+  } catch {
+    return [];
+  }
+}
+
+export function markSourceCredentialDirty(source: TokenSourceName): TokenSourceName[] {
+  if (typeof window === "undefined") return [source];
+  const dirty = Array.from(new Set([...loadDirtySourceCredentials(), source]));
+  localStorage.setItem(DIRTY_SOURCE_CREDENTIALS_KEY, JSON.stringify(dirty));
+  clearCapabilitiesCache();
+  return dirty;
+}
+
+export function clearDirtySourceCredentials(
+  sources: TokenSourceName[],
+): TokenSourceName[] {
+  if (typeof window === "undefined") return [];
+  const cleared = new Set(sources);
+  const remaining = loadDirtySourceCredentials().filter(source => !cleared.has(source));
+  if (remaining.length > 0) {
+    localStorage.setItem(DIRTY_SOURCE_CREDENTIALS_KEY, JSON.stringify(remaining));
+  } else {
+    localStorage.removeItem(DIRTY_SOURCE_CREDENTIALS_KEY);
+  }
+  return remaining;
 }
 
 function readStorage(store: Storage): SourceCredentials {
@@ -270,7 +309,7 @@ export async function restoreSourceConnection(
 
   async function fetchCapabilitiesPayload(): Promise<CapabilitiesResponse | null> {
     try {
-      const response = await fetchCapabilities(base, credentials);
+      const response = await fetchSourceStatus(base, credentials);
       if (!response.ok) return null;
       const payload = (await response.json()) as CapabilitiesResponse;
       saveCapabilitiesCache(credentials, payload);
@@ -319,11 +358,15 @@ export function isLlmPlannerReady(
 export async function connectSources(
   apiBase: string,
   credentials: SourceCredentials = loadSourceCredentials(),
+  sources?: TokenSourceName[],
 ): Promise<
   | {
       ok: true;
       ready: boolean;
       missing: string[];
+      connected: TokenSourceName[];
+      failed: TokenSourceName[];
+      processed: TokenSourceName[];
       capabilities: CapabilitiesResponse;
     }
   | { ok: false; message: string }
@@ -336,7 +379,10 @@ export async function connectSources(
     const response = await fetch(apiUrl("/agent/sources/connect", base), {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(credentialsPayload(credentials)),
+      body: JSON.stringify({
+        ...credentialsPayload(credentials),
+        ...(sources ? { sources } : {}),
+      }),
     });
     const data = await response.json().catch(() => ({}));
     if (!response.ok) {
@@ -352,12 +398,16 @@ export async function connectSources(
       capabilities: data.capabilities,
       required_sources: data.required_sources,
       optional_sources: data.optional_sources,
+      llm_planner: data.llm_planner,
     };
     saveCapabilitiesCache(credentials, capabilities);
     return {
       ok: true,
       ready: Boolean(data.ready),
       missing: Array.isArray(data.missing_sources) ? data.missing_sources : [],
+      connected: Array.isArray(data.connected_sources) ? data.connected_sources : [],
+      failed: Array.isArray(data.failed_sources) ? data.failed_sources : [],
+      processed: Array.isArray(data.processed_sources) ? data.processed_sources : [],
       capabilities,
     };
   } catch {
@@ -398,7 +448,7 @@ export async function ensureGitHubReady(
     return { ok: true, sources: {} };
   }
   try {
-    const response = await fetchCapabilities(base, credentials);
+    const response = await fetchSourceStatus(base, credentials);
     if (!response.ok) {
       return { ok: false, message: `Could not verify GitHub access (${response.status}).` };
     }
@@ -418,6 +468,21 @@ export async function fetchCapabilities(
   credentials: SourceCredentials,
 ): Promise<Response> {
   const url = apiUrl("/agent/capabilities", apiBase);
+  if (hasAnyCredentials(credentials)) {
+    return fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(credentialsPayload(credentials)),
+    });
+  }
+  return fetch(url);
+}
+
+export async function fetchSourceStatus(
+  apiBase: string,
+  credentials: SourceCredentials,
+): Promise<Response> {
+  const url = apiUrl("/agent/sources/status", apiBase);
   if (hasAnyCredentials(credentials)) {
     return fetch(url, {
       method: "POST",

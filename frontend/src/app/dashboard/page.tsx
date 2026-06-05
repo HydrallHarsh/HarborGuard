@@ -148,6 +148,8 @@ function DashboardContent() {
   const [loadingQuip, setLoadingQuip] = useState(DEFAULT_LOADING_QUIP);
   const [completionQuip, setCompletionQuip] = useState<string | null>(null);
   const hasRun = useRef(false);
+  const investigationController = useRef<AbortController | null>(null);
+  const abortTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // Extract query parameters for the payload
   const question = searchParams.get("question") || "";
@@ -222,6 +224,21 @@ function DashboardContent() {
   ]);
 
   useEffect(() => {
+    if (abortTimer.current !== null) {
+      clearTimeout(abortTimer.current);
+      abortTimer.current = null;
+    }
+
+    const scheduleAbort = (controller: AbortController) => {
+      abortTimer.current = setTimeout(() => {
+        controller.abort();
+        if (investigationController.current === controller) {
+          investigationController.current = null;
+        }
+        abortTimer.current = null;
+      }, 0);
+    };
+
     if (historyId) {
       const entry = getInvestigationById(historyId);
       if (entry) {
@@ -240,18 +257,24 @@ function DashboardContent() {
       }
       return;
     }
-    if (hasRun.current) return;
+    if (hasRun.current) {
+      const controller = investigationController.current;
+      return controller ? () => scheduleAbort(controller) : undefined;
+    }
     if (!question || !owner || !repo) {
       router.push("/");
       return;
     }
     hasRun.current = true;
-    void runInvestigation();
+    const controller = new AbortController();
+    investigationController.current = controller;
+    void runInvestigation(controller.signal);
+    return () => scheduleAbort(controller);
   }, [historyId, question, owner, repo, router]);
 
   const sources = capabilities?.capabilities?.sources ?? {};
 
-  async function runInvestigation() {
+  async function runInvestigation(signal: AbortSignal) {
     setLoading(true);
     setError(null);
     setResult(null);
@@ -286,6 +309,7 @@ function DashboardContent() {
       const r = await fetch(apiUrl("/agent/investigate/stream"), {
         method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify(payload),
+        signal,
       });
 
       if (!r.ok || !r.body) {
@@ -358,6 +382,9 @@ function DashboardContent() {
         setLoading(false);
       }
     } catch (err) {
+      if (signal.aborted || (err instanceof DOMException && err.name === "AbortError")) {
+        return;
+      }
       setError(err instanceof Error ? err.message : "Investigation failed");
       setLoading(false);
     }

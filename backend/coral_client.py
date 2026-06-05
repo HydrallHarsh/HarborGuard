@@ -17,6 +17,10 @@ _coral_credential_overrides: contextvars.ContextVar[dict[str, str] | None] = con
     "coral_credential_overrides",
     default=None,
 )
+_coral_cancel_event: contextvars.ContextVar[threading.Event | None] = contextvars.ContextVar(
+    "coral_cancel_event",
+    default=None,
+)
 
 
 def load_dotenv() -> None:
@@ -143,6 +147,22 @@ class CoralClientError(RuntimeError):
     pass
 
 
+class CoralOperationCancelled(CoralClientError):
+    pass
+
+
+@contextmanager
+def coral_cancellation_context(cancel_event: threading.Event | None):
+    if cancel_event is None:
+        yield
+        return
+    reset = _coral_cancel_event.set(cancel_event)
+    try:
+        yield
+    finally:
+        _coral_cancel_event.reset(reset)
+
+
 class CoralClient:
     def __init__(self) -> None:
         load_dotenv()
@@ -156,14 +176,52 @@ class CoralClient:
 
     def _run(self, command: list[str], timeout: float) -> subprocess.CompletedProcess[str]:
         with _coral_lock:
-            return subprocess.run(
+            process = subprocess.Popen(
                 command,
                 env=coral_env(self.config_dir),
                 text=True,
-                capture_output=True,
-                check=False,
-                timeout=timeout,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
             )
+            deadline = time.monotonic() + timeout
+            while True:
+                cancel_event = _coral_cancel_event.get()
+                if cancel_event is not None and cancel_event.is_set():
+                    process.terminate()
+                    try:
+                        stdout, stderr = process.communicate(timeout=2)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        stdout, stderr = process.communicate()
+                    raise CoralOperationCancelled(
+                        (stderr or stdout or "Coral operation cancelled").strip()
+                    )
+
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    process.terminate()
+                    try:
+                        stdout, stderr = process.communicate(timeout=2)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        stdout, stderr = process.communicate()
+                    raise subprocess.TimeoutExpired(
+                        command,
+                        timeout,
+                        output=stdout,
+                        stderr=stderr,
+                    )
+
+                try:
+                    stdout, stderr = process.communicate(timeout=min(0.1, remaining))
+                    return subprocess.CompletedProcess(
+                        command,
+                        process.returncode,
+                        stdout,
+                        stderr,
+                    )
+                except subprocess.TimeoutExpired:
+                    continue
 
     def query(self, sql: str, timeout_seconds: float | None = None) -> CoralResult:
         command = [self.coral_bin, "sql", "--format", "json", sql]

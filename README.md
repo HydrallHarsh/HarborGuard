@@ -493,7 +493,7 @@ Returns discovered Coral tables for known sources.
 
 ### `POST /agent/sources/connect`
 
-Registers community sources and token-backed Coral sources using provided request credentials or server env fallback.
+Registers community sources and token-backed Coral sources using provided request credentials or server env fallback. Pass `sources` to re-run `coral source add` only for credentials that changed.
 
 Request body:
 
@@ -502,19 +502,32 @@ Request body:
   "github_token": "ghp_...",
   "notion_api_key": "ntn_...",
   "slack_token": "xoxb-...",
+  "sources": ["slack"],
   "openrouter_api_key": "sk-or-v1-...",
   "openrouter_model": "openai/gpt-oss-120b:free",
   "use_llm_planner": true
 }
 ```
 
+### `GET /agent/sources/status`
+
+Returns lightweight source readiness without running full Coral capability discovery.
+
+### `POST /agent/sources/status`
+
+Same as `GET /agent/sources/status`, but applies per-request credentials and OpenRouter settings.
+
 ### `GET /agent/capabilities`
 
-Returns Coral source/tool capability metadata using server-side credentials/settings.
+Returns full Coral source/tool capability metadata using server-side credentials/settings.
 
 ### `POST /agent/capabilities`
 
 Same as `GET /agent/capabilities`, but allows per-request credentials and OpenRouter settings.
+
+### `POST /agent/investigate/stream`
+
+Streams investigation progress as server-sent events. Closing the response, including navigating away from the dashboard, cancels the worker and terminates an active Coral subprocess.
 
 ### `GET /agent/coral-debug`
 
