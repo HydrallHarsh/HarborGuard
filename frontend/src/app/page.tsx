@@ -1,28 +1,31 @@
 "use client";
 
-import { FormEvent, useCallback, useEffect, useState } from "react";
+import { type FormEvent, useCallback, useEffect, useState } from "react";
 import { motion, AnimatePresence } from "motion/react";
 import { useRouter } from "next/navigation";
 import { getApiBase } from "./utils/api";
 import {
   areSourcesReady,
+  clearDirtySourceCredentials,
   connectSources,
-  fetchCapabilities,
+  fetchSourceStatus,
   GITHUB_CONNECT_MESSAGE,
   hasGitHubToken,
   isLlmPlannerReady,
   loadCapabilitiesCache,
+  loadDirtySourceCredentials,
   loadSourceCredentials,
+  markSourceCredentialDirty,
   markSourcesConnected,
   OPENROUTER_KEY_PLACEHOLDER,
   OPENROUTER_MODEL_PLACEHOLDER,
   RECOMMENDED_OPENROUTER_MODELS,
   restoreSourceConnection,
-  saveCapabilitiesCache,
   saveSourceCredentials,
   SOURCES_REQUIRED_MESSAGE,
   type CapabilitiesResponse,
   type SourceCredentials,
+  type TokenSourceName,
 } from "./utils/credentials";
 import {
   formatHistoryWhen,
@@ -42,13 +45,6 @@ import {
   pickRandom,
   type InvestigationMode,
 } from "./utils/flavor";
-
-type SourceCapabilities = {
-  available?: boolean;
-  configured?: boolean;
-  optional?: boolean;
-  tools?: string[];
-};
 
 type InvestigationForm = {
   question: string; owner: string; repo: string; org: string; slack_channel: string;
@@ -83,6 +79,7 @@ export default function Home() {
   const [selectedCaseId, setSelectedCaseId] = useState<InvestigationMode | null>("dep");
   const [connecting, setConnecting] = useState(false);
   const [restoringSources, setRestoringSources] = useState(true);
+  const [dirtySources, setDirtySources] = useState<TokenSourceName[]>([]);
   const [history, setHistory] = useState<InvestigationHistoryEntry[]>([]);
 
   const activeMode: InvestigationMode =
@@ -92,23 +89,23 @@ export default function Home() {
       : detectMode(form.question);
   const modeLabel = activeMode === "general" ? "Custom" : MODE_META[activeMode].label;
 
-  async function refreshCapabilities(creds: SourceCredentials = credentials) {
+  const refreshSourceStatus = useCallback(async (creds: SourceCredentials) => {
     try {
-      const r = await fetchCapabilities(getApiBase(), creds);
+      const r = await fetchSourceStatus(getApiBase(), creds);
       if (!r.ok) throw new Error(`${r.status}`);
       const payload = (await r.json()) as CapabilitiesResponse;
       setCapabilities(payload);
-      saveCapabilitiesCache(creds, payload);
       setError(null);
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Could not load capabilities");
+      setError(err instanceof Error ? err.message : "Could not load source status");
     }
-  }
+  }, []);
 
   useEffect(() => {
     setHistory(loadInvestigationHistory());
     const saved = loadSourceCredentials();
     setCredentials(saved);
+    setDirtySources(loadDirtySourceCredentials());
 
     const cached = loadCapabilitiesCache(saved);
     if (cached) {
@@ -121,10 +118,10 @@ export default function Home() {
       setRestoringSources(true);
       const restored = await restoreSourceConnection(getApiBase(), saved);
       if (restored) setCapabilities(restored);
-      else await refreshCapabilities(saved);
+      else await refreshSourceStatus(saved);
       setRestoringSources(false);
     })();
-  }, []);
+  }, [refreshSourceStatus]);
 
   useEffect(() => {
     const id = setInterval(() => setTagline(pickRandom(TAGLINE_ROTATION)), 6000);
@@ -182,7 +179,8 @@ export default function Home() {
   const sources = capabilities?.capabilities?.sources ?? {};
   const llmStatus = capabilities?.llm_planner;
   const githubTokenProvided = hasGitHubToken(credentials);
-  const sourcesReady = areSourcesReady(sources, credentials);
+  const sourcesReady =
+    areSourcesReady(sources, credentials) && !dirtySources.includes("github");
   const llmReady = isLlmPlannerReady(llmStatus, credentials);
   const canSubmit = form.question.trim() && sourcesReady && llmReady;
 
@@ -194,14 +192,23 @@ export default function Home() {
     setConnecting(true);
     setError(null);
     saveSourceCredentials(credentials);
-    const result = await connectSources(getApiBase(), credentials);
+    const result = await connectSources(
+      getApiBase(),
+      credentials,
+      dirtySources.length > 0 ? dirtySources : undefined,
+    );
     setConnecting(false);
     if (!result.ok) {
       setError(result.message);
       return;
     }
     setCapabilities(result.capabilities);
+    setDirtySources(clearDirtySourceCredentials(result.processed));
     if (result.ready) markSourcesConnected();
+    if (result.failed.length > 0) {
+      setError(`Could not update source credentials: ${result.failed.join(", ")}.`);
+      return;
+    }
     if (!result.ready) {
       setError(
         `Required sources not ready${result.missing.length ? `: ${result.missing.join(", ")}` : ""}.`,
@@ -245,7 +252,11 @@ export default function Home() {
   function updateCredentials(next: SourceCredentials) {
     setCredentials(next);
     saveSourceCredentials(next);
-    void refreshCapabilities(next);
+  }
+
+  function updateSourceCredential(source: TokenSourceName, next: SourceCredentials) {
+    updateCredentials(next);
+    setDirtySources(markSourceCredentialDirty(source));
   }
 
   return (
@@ -372,13 +383,13 @@ export default function Home() {
 
             <div className="credGrid">
               <TFSecret label="GitHub token" required value={credentials.github_token ?? ""}
-                set={v => updateCredentials({ ...credentials, github_token: v })}
+                set={v => updateSourceCredential("github", { ...credentials, github_token: v })}
                 ph="ghp_… or fine-grained PAT" />
               <TFSecret label="Notion API key" optional value={credentials.notion_api_key ?? ""}
-                set={v => updateCredentials({ ...credentials, notion_api_key: v })}
+                set={v => updateSourceCredential("notion", { ...credentials, notion_api_key: v })}
                 ph="ntn_… integration secret" />
               <TFSecret label="Slack token" optional value={credentials.slack_token ?? ""}
-                set={v => updateCredentials({ ...credentials, slack_token: v })}
+                set={v => updateSourceCredential("slack", { ...credentials, slack_token: v })}
                 ph="xoxp-… or xoxb-…" />
             </div>
 
@@ -389,7 +400,15 @@ export default function Home() {
                 disabled={!githubTokenProvided || connecting}
                 onClick={() => void handleConnectSources()}
               >
-                {connecting ? "Connecting…" : restoringSources ? "Checking sources…" : sourcesReady ? "Sources connected ✓" : "Connect Sources"}
+                {connecting
+                  ? "Connecting…"
+                  : restoringSources
+                    ? "Checking sources…"
+                    : dirtySources.length > 0
+                      ? "Apply credential changes"
+                      : sourcesReady
+                        ? "Sources connected ✓"
+                        : "Connect Sources"}
               </button>
             </div>
 

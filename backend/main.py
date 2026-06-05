@@ -1,4 +1,6 @@
 import ast
+import asyncio
+import contextvars
 import json
 import logging
 import os
@@ -19,7 +21,14 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from coral_mcp_client import CoralMCPClient, CoralMCPError, mcp_discovery_enabled
-from coral_client import CoralClient, CoralClientError, get_credential, load_dotenv
+from coral_client import (
+    CoralClient,
+    CoralClientError,
+    CoralOperationCancelled,
+    coral_cancellation_context,
+    get_credential,
+    load_dotenv,
+)
 from llm_orchestrator import (
     LLMPlannerError,
     build_llm_planner_status,
@@ -46,7 +55,14 @@ def configure_logging() -> None:
 configure_logging()
 logger = logging.getLogger("harborguard.api")
 
-_active_progress_queue: queue.Queue | None = None
+_active_progress_queue: contextvars.ContextVar[queue.Queue | None] = contextvars.ContextVar(
+    "active_progress_queue",
+    default=None,
+)
+
+
+class InvestigationCancelled(RuntimeError):
+    pass
 
 app = FastAPI(
     title="HarborGuard",
@@ -171,6 +187,10 @@ class SourceCredentials(BaseModel):
     openrouter_api_key: str | None = None
     openrouter_model: str | None = None
     use_llm_planner: bool | None = None
+
+
+class SourceConnectRequest(SourceCredentials):
+    sources: list[str] | None = None
 
 
 class AgentInvestigationReq(SourceCredentials):
@@ -371,12 +391,21 @@ def connect_token_sources(
     required_only: bool = False,
     *,
     skip_installed: bool = False,
+    source_names: set[str] | None = None,
+    refresh_sources: set[str] | None = None,
 ) -> list[dict[str, object]]:
     """Run `coral source add` for bundled sources when credentials are present."""
     installed = installed_coral_schemas() if skip_installed else set()
+    refresh_sources = refresh_sources or set()
     results: list[dict[str, object]] = []
     for source_name, env_key in BUNDLED_TOKEN_SOURCES.items():
-        if skip_installed and source_name in installed:
+        if source_names is not None and source_name not in source_names:
+            continue
+        if (
+            skip_installed
+            and source_name in installed
+            and source_name not in refresh_sources
+        ):
             results.append(
                 {
                     "source": source_name,
@@ -412,6 +441,8 @@ def connect_token_sources(
                 )
             logger.info("sources.token.ok source=%s", source_name)
             results.append(payload)
+        except CoralOperationCancelled:
+            raise
         except (CoralClientError, RuntimeError) as error:
             logger.warning("sources.token.error source=%s error=%s", source_name, error)
             results.append({"source": source_name, "ok": False, "error": str(error)})
@@ -420,12 +451,22 @@ def connect_token_sources(
     return results
 
 
-def connect_all_coral_sources(*, required: bool = False) -> dict[str, object]:
+def connect_all_coral_sources(
+    *,
+    required: bool = False,
+    source_names: set[str] | None = None,
+    refresh_sources: set[str] | None = None,
+) -> dict[str, object]:
     """Register community + token-backed Coral sources."""
     installed = installed_coral_schemas()
     if not set(REQUIRED_INVESTIGATION_SOURCES).issubset(installed):
         ensure_community_sources()
-    token_results = connect_token_sources(required_only=required, skip_installed=True)
+    token_results = connect_token_sources(
+        required_only=required,
+        skip_installed=True,
+        source_names=source_names,
+        refresh_sources=refresh_sources,
+    )
     if not set(REQUIRED_INVESTIGATION_SOURCES).issubset(installed_coral_schemas()):
         ensure_community_sources()
     community = [{"source": name, "ok": name in installed_coral_schemas()} for name in ("osv", "deps_dev")]
@@ -449,6 +490,8 @@ def installed_coral_schemas() -> set[str]:
             for row in result.rows
             if row.get("schema_name")
         }
+    except CoralOperationCancelled:
+        raise
     except CoralClientError as error:
         logger.warning("sources.schema_check.failed error=%s", compact_text(str(error)))
         return set()
@@ -480,12 +523,81 @@ def ensure_investigation_sources_ready() -> None:
                         source_name,
                         payload.get("message"),
                     )
+            except CoralOperationCancelled:
+                raise
             except CoralClientError as error:
                 logger.warning("sources.optional_add.error source=%s error=%s", source_name, error)
 
 
 def sources_investigation_ready(capabilities: dict[str, object]) -> bool:
     return not missing_investigation_sources(capabilities)
+
+
+def build_lightweight_capabilities() -> dict[str, object]:
+    """Fast source readiness response for connect/status UI.
+
+    Full schema discovery is intentionally skipped here because it can take tens
+    of seconds after a source install. Investigations still run full discovery.
+    """
+    installed = installed_coral_schemas()
+    sources: dict[str, dict[str, object]] = {}
+    for source in REQUIRED_SOURCES:
+        env_key = BUNDLED_TOKEN_SOURCES.get(source)
+        token_provided = bool(get_credential(env_key)) if env_key else True
+        available = source in installed
+        if source in ("osv", "deps_dev"):
+            configured = available
+        elif source == "github":
+            configured = available and token_provided
+        elif source in OPTIONAL_TOKEN_SOURCES:
+            configured = True if not token_provided else available
+        else:
+            configured = available
+
+        sources[source] = {
+            "available": available,
+            "optional": source in OPTIONAL_TOKEN_SOURCES,
+            "required_for_investigation": source in REQUIRED_INVESTIGATION_SOURCES,
+            "inputs": [],
+            "configured": configured,
+            "missing_inputs": [] if configured else ([env_key] if env_key else []),
+            "tools": [
+                tool_name
+                for tool_name, tool in INVESTIGATION_TOOLS.items()
+                if tool["source"] == source
+            ],
+        }
+
+    return {
+        "sources": sources,
+        "tools": {},
+        "summary": {
+            "required_source_count": len(REQUIRED_INVESTIGATION_SOURCES),
+            "available_source_count": sum(
+                1 for source in sources.values() if source["available"]
+            ),
+            "available_tool_count": 0,
+            "metadata_ok": True,
+            "unavailable_sources": [
+                name
+                for name in REQUIRED_INVESTIGATION_SOURCES
+                if not sources[name]["available"]
+            ],
+            "unconfigured_sources": [
+                name
+                for name in REQUIRED_INVESTIGATION_SOURCES
+                if not sources[name]["configured"]
+            ],
+            "optional_sources": [
+                name
+                for name in OPTIONAL_TOKEN_SOURCES
+                if name in sources
+            ],
+            "missing_for_investigation": missing_investigation_sources({"sources": sources}),
+        },
+        "metadata_steps": [],
+        "discovery_backend": "lightweight_source_check",
+    }
 
 
 def missing_investigation_sources(capabilities: dict[str, object]) -> list[str]:
@@ -1432,6 +1544,8 @@ def fetch_manifest_via_coral(
     """
     try:
         result = coral.query(sql, timeout_seconds=github_query_timeout())
+    except CoralOperationCancelled:
+        raise
     except CoralClientError as error:
         logger.warning(
             "manifest.coral.failed owner=%s repo=%s path=%s error=%s",
@@ -1708,6 +1822,8 @@ def query_step_with_timeout(
     )
     try:
         result = coral.query(sql, timeout_seconds=timeout_seconds)
+    except CoralOperationCancelled:
+        raise
     except CoralClientError as error:
         duration_ms = elapsed_ms(started_at)
         logger.warning(
@@ -1732,8 +1848,9 @@ def query_step_with_timeout(
         duration_ms,
         len(result.rows),
     )
-    if _active_progress_queue is not None and not name.startswith("metadata_"):
-        _active_progress_queue.put({
+    progress_queue = _active_progress_queue.get()
+    if progress_queue is not None and not name.startswith("metadata_"):
+        progress_queue.put({
             "type": "query",
             "name": name,
             "sql": sql,
@@ -3479,8 +3596,8 @@ def sources() -> dict[str, object]:
 
 
 @app.post("/agent/sources/connect")
-def connect_sources(req: SourceCredentials) -> dict[str, object]:
-    """Run `coral source add` for all provided tokens plus community osv/deps_dev manifests."""
+def connect_sources(req: SourceConnectRequest) -> dict[str, object]:
+    """Register community sources and add only the requested token-backed sources."""
     with user_settings_from_req(req):
         started_at = time.perf_counter()
         logger.info("endpoint.sources_connect.start")
@@ -3497,12 +3614,46 @@ def connect_sources(req: SourceCredentials) -> dict[str, object]:
                     "missing_env_keys": missing_tokens,
                 },
             )
+        requested_sources = (
+            set(req.sources)
+            if req.sources is not None
+            else {
+                source
+                for source, env_key in BUNDLED_TOKEN_SOURCES.items()
+                if get_credential(env_key)
+            }
+        )
+        unknown_sources = requested_sources.difference(BUNDLED_TOKEN_SOURCES)
+        if unknown_sources:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "message": "Unknown token-backed Coral source.",
+                    "sources": sorted(unknown_sources),
+                },
+            )
         try:
-            connect_payload = connect_all_coral_sources(required=True)
+            connect_payload = connect_all_coral_sources(
+                required=True,
+                source_names=requested_sources,
+                refresh_sources=requested_sources,
+            )
         except RuntimeError as error:
             raise HTTPException(status_code=502, detail=str(error)) from error
-        capabilities = discover_capabilities()
+        capabilities = build_lightweight_capabilities()
         ready = sources_investigation_ready(capabilities)
+        token_results = connect_payload["token_sources"]
+        connected_sources = [
+            str(item["source"])
+            for item in token_results
+            if item.get("ok") and not item.get("skipped")
+        ]
+        failed_sources = [
+            str(item["source"])
+            for item in token_results
+            if not item.get("ok") and not item.get("skipped")
+        ]
+        processed_sources = sorted(requested_sources.difference(failed_sources))
         duration_ms = elapsed_ms(started_at)
         logger.info(
             "endpoint.sources_connect.done duration_ms=%s ready=%s missing=%s",
@@ -3515,8 +3666,35 @@ def connect_sources(req: SourceCredentials) -> dict[str, object]:
             "ready": ready,
             "missing_sources": missing_investigation_sources(capabilities),
             "capabilities": capabilities,
+            "connected_sources": connected_sources,
+            "failed_sources": failed_sources,
+            "processed_sources": processed_sources,
+            "required_sources": list(REQUIRED_INVESTIGATION_SOURCES),
+            "optional_sources": list(OPTIONAL_TOKEN_SOURCES),
+            "llm_planner": build_llm_planner_status(),
             "duration_ms": duration_ms,
         }
+
+
+@app.get("/agent/sources/status")
+def source_status_get() -> dict[str, object]:
+    return build_source_status_response()
+
+
+@app.post("/agent/sources/status")
+def source_status_post(req: SourceCredentials) -> dict[str, object]:
+    with user_settings_from_req(req):
+        return build_source_status_response()
+
+
+def build_source_status_response() -> dict[str, object]:
+    return {
+        "description": "Lightweight Coral source readiness status.",
+        "required_sources": list(REQUIRED_INVESTIGATION_SOURCES),
+        "optional_sources": list(OPTIONAL_TOKEN_SOURCES),
+        "capabilities": build_lightweight_capabilities(),
+        "llm_planner": build_llm_planner_status(),
+    }
 
 
 @app.get("/agent/capabilities")
@@ -3709,29 +3887,49 @@ def agent_investigate(req: AgentInvestigationReq) -> dict[str, object]:
 
 
 @app.post("/agent/investigate/stream")
-def agent_investigate_stream(req: AgentInvestigationReq):
+def agent_investigate_stream(req: AgentInvestigationReq, request: Request):
     q: queue.Queue = queue.Queue()
+    cancel_event = threading.Event()
 
     def worker() -> None:
         try:
-            with user_settings_from_req(req):
-                result = agent_investigate_internal(req, progress_queue=q)
-                q.put({"type": "complete", "data": result})
+            with coral_cancellation_context(cancel_event), user_settings_from_req(req):
+                result = agent_investigate_internal(
+                    req,
+                    progress_queue=q,
+                    cancel_event=cancel_event,
+                )
+                if not cancel_event.is_set():
+                    q.put({"type": "complete", "data": result})
+        except (CoralOperationCancelled, InvestigationCancelled):
+            logger.info("agent_investigate_stream worker cancelled")
+            if not cancel_event.is_set():
+                q.put({"type": "cancelled"})
         except Exception as e:
             logger.exception("agent_investigate_stream worker failed")
-            q.put({"type": "error", "error": str(e) or "Investigation failed"})
+            if not cancel_event.is_set():
+                q.put({"type": "error", "error": str(e) or "Investigation failed"})
 
     threading.Thread(target=worker, daemon=True).start()
 
     async def event_stream():
-        while True:
-            try:
-                item = await anyio.to_thread.run_sync(lambda: q.get(timeout=0.5))
-                yield f"data: {json.dumps(jsonable_encoder(item))}\n\n"
-                if item.get("type") in ("complete", "error"):
+        try:
+            while True:
+                if await request.is_disconnected():
+                    logger.info("agent_investigate_stream client disconnected")
                     break
-            except queue.Empty:
-                yield ": keepalive\n\n"
+                try:
+                    item = await anyio.to_thread.run_sync(lambda: q.get(timeout=0.25))
+                    yield f"data: {json.dumps(jsonable_encoder(item))}\n\n"
+                    if item.get("type") in ("complete", "error", "cancelled"):
+                        break
+                except queue.Empty:
+                    yield ": keepalive\n\n"
+        except asyncio.CancelledError:
+            logger.info("agent_investigate_stream response cancelled")
+            raise
+        finally:
+            cancel_event.set()
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")
 
@@ -3739,11 +3937,16 @@ def agent_investigate_stream(req: AgentInvestigationReq):
 def agent_investigate_internal(
     req: AgentInvestigationReq,
     progress_queue: queue.Queue | None = None,
+    cancel_event: threading.Event | None = None,
 ) -> dict[str, object]:
-    global _active_progress_queue
-    _active_progress_queue = progress_queue
+    progress_token = _active_progress_queue.set(progress_queue)
+
+    def check_cancelled() -> None:
+        if cancel_event is not None and cancel_event.is_set():
+            raise InvestigationCancelled("Investigation cancelled by client")
 
     def emit(msg: str) -> None:
+        check_cancelled()
         if progress_queue:
             progress_queue.put({"type": "progress", "message": msg})
 
@@ -3803,11 +4006,13 @@ def agent_investigate_internal(
         ensure_investigation_sources_ready()
         emit("Discovering capabilities and connected sources...")
         capabilities = discover_capabilities()
+        check_cancelled()
         require_sources_for_investigation(capabilities)
         emit(f"Discovered {len(capabilities.get('tools', []))} available tools")
         metadata_steps = capabilities.get("metadata_steps", [])
         emit("Planning investigation...")
         plan = plan_with_orchestrator(req, capabilities)
+        check_cancelled()
         selected_tools = set(plan["selected_tools"])
 
         steps: list[dict[str, object]] = []
@@ -3857,6 +4062,7 @@ def agent_investigate_internal(
         # Phase 2: extract target package/version from PRs and alerts.
         emit("Extracting manifest and package candidates...")
         manifest_candidates = fetch_manifest_candidates(req.owner, req.repo)
+        check_cancelled()
         if not manifest_candidates:
             logger.warning(
                 "manifest.pass.empty owner=%s repo=%s tried=package.json paths on default branch",
@@ -3906,6 +4112,7 @@ def agent_investigate_internal(
     
         emit(f"Deep scanning {len(deep_scan_targets)} package target(s)...")
         for target in deep_scan_targets:
+            check_cancelled()
             pkg = target.get("package_name", "unknown")
             ver = target.get("version") or "unknown"
             tag = f"{pkg}:{ver}"
@@ -3953,6 +4160,7 @@ def agent_investigate_internal(
             question_intent["secrets"] or "github.search_code" in selected_tools
         )
         if run_secret_search:
+            check_cancelled()
             secret_step = query_step("github_secret_file_search", github_secret_file_search_sql)
             if question_intent["secrets"]:
                 search_rows = first_rows(secret_step, limit=10)
@@ -3983,6 +4191,7 @@ def agent_investigate_internal(
             or "notion.search" in selected_tools
         )
         if run_policy_search:
+            check_cancelled()
             steps.append(fetch_notion_policy_step(req.policy_query, req.question))
         else:
             skipped = next(
@@ -4009,6 +4218,7 @@ def agent_investigate_internal(
             LIMIT 20
             """
             if "slack.messages" in selected_tools and tool_available(capabilities, "slack.messages"):
+                check_cancelled()
                 steps.append(query_step("slack_security_discussion", slack_security_discussion_sql))
             else:
                 skipped = next(
@@ -4038,10 +4248,14 @@ def agent_investigate_internal(
         if payload:
             turn = 0
             while turn < 3:
+                check_cancelled()
                 turn += 1
                 started_at_t = time.perf_counter()
                 try:
                     tool_calls, raw_message = openrouter_chat_tools(payload, started_at_t, f"llm.dynamic_turn_{turn}")
+                    check_cancelled()
+                except InvestigationCancelled:
+                    raise
                 except Exception as e:
                     logger.warning("llm.dynamic_turn.error turn=%s error=%s", turn, e)
                     break
@@ -4052,6 +4266,7 @@ def agent_investigate_internal(
                 payload["messages"].append(raw_message)
             
                 for i, call in enumerate(tool_calls, start=1):
+                    check_cancelled()
                     tool_name = call.get("function", {}).get("name")
                     call_id = call.get("id")
                     if not tool_name:
@@ -4135,6 +4350,8 @@ def agent_investigate_internal(
                             "content": json.dumps(result_rows[:10])
                         })
                         logger.info("agent.dynamic_tool.ok name=%s duration_ms=%s rows=%s", step_name, duration_ms, len(result_rows))
+                    except CoralOperationCancelled:
+                        raise
                     except Exception as error:
                         logger.warning("agent.dynamic_tool.error name=%s error=%s", step_name, error)
                         steps.append({
@@ -4158,6 +4375,7 @@ def agent_investigate_internal(
         if not scan_results:
             dynamic_candidates = []
             for step in steps:
+                check_cancelled()
                 if not step.get("is_dynamic") or not step.get("rows"):
                     continue
                 rows = step.get("rows", [])
@@ -4179,6 +4397,7 @@ def agent_investigate_internal(
             if dynamic_candidates:
                 dynamic_candidates = dedupe_candidates(dynamic_candidates)
                 for dynamic_target in dynamic_candidates[:5]:
+                    check_cancelled()
                     if dynamic_target and dynamic_target.get("version") and dynamic_target.get("system"):
                         if not scan_results:
                             # Set primary request info from first target
@@ -4300,4 +4519,4 @@ def agent_investigate_internal(
             },
         }
     finally:
-        _active_progress_queue = None
+        _active_progress_queue.reset(progress_token)
