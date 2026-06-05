@@ -288,8 +288,8 @@ GITHUB_TOKEN=ghp_your_token_here
 NOTION_API_KEY=ntn_your_token_here
 SLACK_TOKEN=xoxb_or_xoxp_token_here
 
-# Optional OpenRouter planner
-HARBORGUARD_USE_LLM_PLANNER=false
+# Optional OpenRouter defaults
+# Leave HARBORGUARD_USE_LLM_PLANNER unset if users should choose in the UI.
 OPENROUTER_API_KEY=sk-or-v1-your_key_here
 OPENROUTER_MODEL=openai/gpt-oss-120b:free
 
@@ -318,7 +318,8 @@ The backend resolves relative `CORAL_BIN` paths from the repository root.
 | `CORAL_SCHEMA_CHECK_TIMEOUT_SECONDS` | `12` | Source schema readiness check timeout |
 | `CORAL_METADATA_TIMEOUT_SECONDS` | `12` | Capability metadata query timeout |
 | `CORAL_MCP_TIMEOUT_SECONDS` | `8` | Optional MCP request timeout |
-| `HARBORGUARD_CORS_ORIGINS` | localhost frontend origins | Comma-separated allowed frontend origins, or `*` |
+| `HARBORGUARD_CORS_ORIGINS` | localhost frontend origins | Comma-separated exact allowed frontend origins, or `*` |
+| `HARBORGUARD_CORS_ORIGIN_REGEX` | unset | Optional regex for dynamic preview URLs, e.g. Vercel previews |
 | `HARBORGUARD_USE_FIXTURES` | `false` | Return canned responses from `backend/fixtures` |
 | `HARBORGUARD_FIXTURES_DIR` | `backend/fixtures` | Custom fixture directory |
 | `HARBORGUARD_LOG_LEVEL` | `INFO` | Backend logging level |
@@ -326,7 +327,7 @@ The backend resolves relative `CORAL_BIN` paths from the repository root.
 | `HARBORGUARD_ENABLE_GITHUB_ALERTS` | `false` | Enable GitHub Dependabot org alert queries |
 | `HARBORGUARD_GITHUB_QUERY_TIMEOUT_SECONDS` | `20` | Timeout for GitHub Coral queries |
 | `HARBORGUARD_GITHUB_RAW_FALLBACK` | falsey | Try raw GitHub file fetch fallback for manifests/secrets |
-| `HARBORGUARD_USE_LLM_PLANNER` | `false` | Enable OpenRouter planner/dynamic investigation features |
+| `HARBORGUARD_USE_LLM_PLANNER` | `false` | Optional server-side default. Prefer leaving it unset so users choose planner mode in the UI. |
 | `OPENROUTER_API_KEY` | unset | OpenRouter API key |
 | `OPENROUTER_MODEL` | unset | OpenRouter model slug |
 | `OPENROUTER_TIMEOUT_SECONDS` | `15` or `30` depending on call | OpenRouter request timeout |
@@ -694,7 +695,14 @@ http://localhost:3000
 http://127.0.0.1:3000
 ```
 
-For deployed frontends, set `HARBORGUARD_CORS_ORIGINS` to the deployed frontend URL.
+For deployed frontends, set `HARBORGUARD_CORS_ORIGINS` to the deployed production frontend URL. For dynamic Vercel preview URLs, set `HARBORGUARD_CORS_ORIGIN_REGEX` once instead of redeploying the backend for every preview:
+
+```env
+HARBORGUARD_CORS_ORIGINS=https://harborguard-security.vercel.app
+HARBORGUARD_CORS_ORIGIN_REGEX=^https://harborguard-security(-[a-z0-9-]+)?\\.vercel\\.app$
+```
+
+Use the preview URL pattern for your actual Vercel project/team if it differs.
 
 ### `GitHub token required`
 
@@ -752,22 +760,18 @@ Check backend logs. Common causes:
 - Backend host/proxy request timeout.
 - OpenRouter timeout or invalid model when AI planner is enabled.
 
-### OpenRouter planner is enabled but blocked
+### OpenRouter planner falls back to deterministic mode
 
-Either configure both values:
+Planner mode is user-controlled from the UI. If the user enables AI planning but no OpenRouter key/model is available, HarborGuard falls back to deterministic planning.
+
+To make AI planning work, configure both values in the UI or as server defaults:
 
 ```env
 OPENROUTER_API_KEY=sk-or-v1-...
 OPENROUTER_MODEL=openai/gpt-oss-120b:free
 ```
 
-or disable the UI toggle / set:
-
-```env
-HARBORGUARD_USE_LLM_PLANNER=false
-```
-
-When disabled, HarborGuard uses the deterministic planner.
+For deployments where users should choose, leave `HARBORGUARD_USE_LLM_PLANNER` unset.
 
 ## Security and privacy notes
 
